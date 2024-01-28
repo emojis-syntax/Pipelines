@@ -1,0 +1,863 @@
+######################################################
+Complete pipeline with all the information
+######################################################
+# Pipeline for UKRAINEWAR:
+
+cd /disco2/keyphrase
+./proc_tweets.py -d /disco2/UKRAINEWAR/tweets/2022-02
+./proc_tweets.py -d /disco2/UKRAINEWAR/tweets/2022-03
+./proc_tweets.py -d /disco2/UKRAINEWAR/tweets/2022-04
+./proc_tweets.py -d /disco2/UKRAINEWAR/tweets/2022-05
+./proc_tweets.py -d /disco2/UKRAINEWAR/tweets/2022-06
+./proc_tweets.py -d /disco2/UKRAINEWAR/tweets/2022-07
+
+./ngo.sh /disco2/UKRAINEWAR/tweets/2022-02
+./ngo.sh /disco2/UKRAINEWAR/tweets/2022-03
+./ngo.sh /disco2/UKRAINEWAR/tweets/2022-04
+./ngo.sh /disco2/UKRAINEWAR/tweets/2022-05
+./ngo.sh /disco2/UKRAINEWAR/tweets/2022-06
+./ngo.sh /disco2/UKRAINEWAR/tweets/2022-07
+
+./creat_tw.py -d /disco2/UKRAINEWAR/tweets/2022-02
+./creat_tw.py -d /disco2/UKRAINEWAR/tweets/2022-03
+./creat_tw.py -d /disco2/UKRAINEWAR/tweets/2022-04
+./creat_tw.py -d /disco2/UKRAINEWAR/tweets/2022-05
+./creat_tw.py -d /disco2/UKRAINEWAR/tweets/2022-06
+./creat_tw.py -d /disco2/UKRAINEWAR/tweets/2022-07
+
+#############################################################
+# Restart ElasticSearch on Ubuntu
+
+service elasticsearch restart
+
+################################################################
+# Allow an ElasticSearch scroll to live for 30 days. The default is 1 day (24h)
+# https://www.elastic.co/guide/en/elasticsearch/reference/current/cluster-update-settings.html
+#
+# As I make a query to get all the records, this may cause a timeout.
+# To do this, you need to use the scroll and timeout parameters in the "elasticsearch.helpers.scan" function
+# https://www.elastic.co/guide/en/elasticsearch/reference/current/paginate-search-results.html#scroll-search-context
+# https://www.elastic.co/guide/en/elasticsearch/reference/current/common-options.html#time-units
+# https://github.com/elastic/elasticsearch-dsl-py/issues/796
+# https://stackoverflow.com/questions/33301119/error-with-elasticsearch-helpers-scan-api-when-using-query-parameter
+
+curl -X PUT "localhost:9200/_cluster/settings" -H 'Content-Type: application/json' -d'
+{
+  "persistent" : {
+    "search.max_keep_alive" : "30d"
+  }
+}
+'
+################################################################
+### Delete previous records, if necessary
+### curl -H "Content-Type: application/json" -XDELETE 127.0.0.1:9200/ukrainewar
+
+# Create the mapping
+# Create a field in elasticsearch for searches by 24 different processors, to allow multiprocessing when loading neo4j
+# Create a field in elasticsearch to process data for different days, from 1 to 31
+# Create a field in elasticsearch to store the sum of emojis in the emojis array
+
+curl -H "Content-Type: application/json" -XPUT 127.0.0.1:9200/ukrainewar -d '
+{
+	"mappings": {
+		"properties": {
+			"id_str": {"type": "long"}, 
+			"created_at": {"type": "date"}, 
+			"text": {"type": "text"}, 
+			"emoji": {
+				"type": "text", 
+				"fields": { "keyword": { "type": "keyword" } }
+			},
+			"id24": {"type": "long"},
+			"id31": {"type": "long"},
+			"n_emoji": {"type": "long"}
+		 }
+	}
+}
+'
+
+# Confirm the mapping
+curl -H "Content-Type: application/json" -XGET '127.0.0.1:9200/ukrainewar/_mapping?pretty'
+
+mkdir /disco5/UKRAINEWAR
+mkdir /disco5/UKRAINEWAR/tweets
+rsync -zarv  --prune-empty-dirs --include "*/"  --include="*.tw" --exclude="*" "/disco2/UKRAINEWAR/tweets/" "/disco5/UKRAINEWAR/tweets/"
+
+cd /disco2/keyphrase
+./read2ES.py -i ukrainewar -d /disco5/UKRAINEWAR/tweets/2022-02
+./read2ES.py -i ukrainewar -d /disco5/UKRAINEWAR/tweets/2022-03
+./read2ES.py -i ukrainewar -d /disco5/UKRAINEWAR/tweets/2022-04
+./read2ES.py -i ukrainewar -d /disco5/UKRAINEWAR/tweets/2022-05
+./read2ES.py -i ukrainewar -d /disco5/UKRAINEWAR/tweets/2022-06
+./read2ES.py -i ukrainewar -d /disco5/UKRAINEWAR/tweets/2022-07
+
+# Confirm insertion
+curl -H "Content-Type: application/json" -XGET '127.0.0.1:9200/ukrainewar/_count?pretty'
+{
+  "count" : 45068599,
+  "_shards" : {
+    "total" : 1,
+    "successful" : 1,
+    "skipped" : 0,
+    "failed" : 0
+  }
+}
+
+
+rm -r /disco5/UKRAINEWAR/
+
+################################################################
+# Create 31 groups - one for each day of the month - within the CLIMATE index, to then process each day separately
+# Create 24 groups - one for each hour of the day - within the CLIMATE index, and then assign them to 24 processors
+# It took 9401632 millis to update, there are 45068599 entries in elasticsearch
+# Fill in the n_emoji field with the sum of the emojis in the document
+curl -X POST "localhost:9200/ukrainewar/_update_by_query?pretty" -H 'Content-Type: application/json' -d'
+{
+"query": {"match_all": {}
+         },
+"script": "ctx._source.id31 = Integer.parseInt(ctx._source.created_at.substring(8,10)); ctx._source.id24 = Integer.parseInt(ctx._source.created_at.substring(11,13)); ctx._source.n_emoji = ctx._source.emoji.length"
+}
+'
+
+#--------------------------------------------------------
+# Monitor the evolution of previous code
+
+# Count docs without id24
+curl -X POST "localhost:9200/ukrainewar/_count?pretty" -H 'Content-Type: application/json' -d'
+{
+"query": {
+	"bool": {
+		"must_not": [
+			{
+				"exists": {
+					"field": "id24"
+					}
+				}
+			]
+		}	
+	}
+}
+'
+
+# Count docs with id24
+curl -X POST "localhost:9200/ukrainewar/_count?pretty" -H 'Content-Type: application/json' -d'
+{
+"query": {
+	"bool": {
+		"must": [
+			{
+				"exists": {
+					"field": "id24"
+					}
+				}
+			]
+		}	
+	}
+}
+'
+
+######################################################
+# Fill in the n_emoji field with the sum of the emojis in the document
+# It took 9901368 milliseconds
+# curl -X POST "localhost:9200/ukrainewar/_update_by_query?pretty" -H 'Content-Type: application/json' -d'
+# {
+# "query": {"match_all": {}
+# },
+# "script": "ctx._source.n_emoji = ctx._source.emoji.length"
+# }
+# '
+
+#---------------------------------------------------------------- -------
+# Monitor the evolution of previous code
+
+# Count docs without n_emoji
+# curl -X POST "localhost:9200/ukrainewar/_count?pretty" -H 'Content-Type: application/json' -d'
+# {
+# "query": {
+# "bool": {
+# "must_not": [
+# {
+# "exists": {
+# "field": "n_emoji"
+# }
+# }
+# ]
+# }
+# }
+# }
+# '
+
+# Count docs with n_emoji
+# curl -X POST "localhost:9200/ukrainewar/_count?pretty" -H 'Content-Type: application/json' -d'
+# {
+# "query": {
+# "bool": {
+# "must": [
+# {
+# "exists": {
+# "field": "n_emoji"
+# }
+# }
+# ]
+# }
+# }
+# }
+# '
+
+################################################ ####
+# I have to increase the number of possible ES answers. I may have to do this several times until the command below stops giving an error.
+curl -X PUT "localhost:9200/_settings" -H 'Content-Type: application/json' -d'
+{
+   "index.max_result_window": 2000000000
+}
+'
+
+################################################ ####
+# Launch neo4j:
+
+/usr/local/neo4j/bin/neo4j console
+
+# Put all emojis in Neo4j and MariaDB
+# In Neo4j, add the "n.ukrainewar" property to each emoji, with the number of occurrences of that emoji
+cd /disco2/keyphrase
+./esPutEmojiNeo4jMariaDB.py -i ukrainewar -d 1
+./esPutEmojiNeo4jMariaDB.py -i ukrainewar -d 2
+./esPutEmojiNeo4jMariaDB.py -i ukrainewar -d 3
+./esPutEmojiNeo4jMariaDB.py -i ukrainewar -d 4
+./esPutEmojiNeo4jMariaDB.py -i ukrainewar -d 5
+./esPutEmojiNeo4jMariaDB.py -i ukrainewar -d 6
+./esPutEmojiNeo4jMariaDB.py -i ukrainewar -d 7
+./esPutEmojiNeo4jMariaDB.py -i ukrainewar -d 8
+./esPutEmojiNeo4jMariaDB.py -i ukrainewar -d 9
+./esPutEmojiNeo4jMariaDB.py -i ukrainewar -d 10
+./esPutEmojiNeo4jMariaDB.py -i ukrainewar -d 11
+./esPutEmojiNeo4jMariaDB.py -i ukrainewar -d 12
+./esPutEmojiNeo4jMariaDB.py -i ukrainewar -d 13
+./esPutEmojiNeo4jMariaDB.py -i ukrainewar -d 14
+./esPutEmojiNeo4jMariaDB.py -i ukrainewar -d 15
+./esPutEmojiNeo4jMariaDB.py -i ukrainewar -d 16
+./esPutEmojiNeo4jMariaDB.py -i ukrainewar -d 17
+./esPutEmojiNeo4jMariaDB.py -i ukrainewar -d 18
+./esPutEmojiNeo4jMariaDB.py -i ukrainewar -d 19
+./esPutEmojiNeo4jMariaDB.py -i ukrainewar -d 20
+./esPutEmojiNeo4jMariaDB.py -i ukrainewar -d 21
+./esPutEmojiNeo4jMariaDB.py -i ukrainewar -d 22
+./esPutEmojiNeo4jMariaDB.py -i ukrainewar -d 23
+./esPutEmojiNeo4jMariaDB.py -i ukrainewar -d 24
+./esPutEmojiNeo4jMariaDB.py -i ukrainewar -d 25
+./esPutEmojiNeo4jMariaDB.py -i ukrainewar -d 26
+./esPutEmojiNeo4jMariaDB.py -i ukrainewar -d 27
+./esPutEmojiNeo4jMariaDB.py -i ukrainewar -d 28
+./esPutEmojiNeo4jMariaDB.py -i ukrainewar -d 29
+./esPutEmojiNeo4jMariaDB.py -i ukrainewar -d 30
+./esPutEmojiNeo4jMariaDB.py -i ukrainewar -d 31
+
+################################################################
+# Times that the previous commands took:
+
+root@alex:/disco2/keyphrase# ./esPutEmojiNeo4jMariaDB.py -i ukrainewar -d 1
+Total time 159.54953503608704 seconds
+root@alex:/disco2/keyphrase# ./esPutEmojiNeo4jMariaDB.py -i ukrainewar -d 2
+Total time 117.25972509384155 seconds
+root@alex:/disco2/keyphrase# ./esPutEmojiNeo4jMariaDB.py -i ukrainewar -d 3
+Total time 57.31165862083435 seconds
+root@alex:/disco2/keyphrase# ./esPutEmojiNeo4jMariaDB.py -i ukrainewar -d 4
+Total time 59.37094569206238 seconds
+root@alex:/disco2/keyphrase# ./esPutEmojiNeo4jMariaDB.py -i ukrainewar -d 5
+Total time 109.0777235031128 seconds
+root@alex:/disco2/keyphrase# ./esPutEmojiNeo4jMariaDB.py -i ukrainewar -d 6
+Total time 109.23985505104065 seconds
+root@alex:/disco2/keyphrase# ./esPutEmojiNeo4jMariaDB.py -i ukrainewar -d 7
+Total time 107.45257115364075 seconds
+root@alex:/disco2/keyphrase# ./esPutEmojiNeo4jMariaDB.py -i ukrainewar -d 8
+Total time 103.14866590499878 seconds
+root@alex:/disco2/keyphrase# ./esPutEmojiNeo4jMariaDB.py -i ukrainewar -d 9
+Total time 110.69300103187561 seconds
+root@alex:/disco2/keyphrase# ./esPutEmojiNeo4jMariaDB.py -i ukrainewar -d 10
+Total time 76.29971122741699 seconds
+root@alex:/disco2/keyphrase# ./esPutEmojiNeo4jMariaDB.py -i ukrainewar -d 11
+Total time 83.51438903808594 seconds
+root@alex:/disco2/keyphrase# ./esPutEmojiNeo4jMariaDB.py -i ukrainewar -d 12
+Total time 85.46000266075134 seconds
+root@alex:/disco2/keyphrase# ./esPutEmojiNeo4jMariaDB.py -i ukrainewar -d 13
+Total time 88.83503150939941 seconds
+root@alex:/disco2/keyphrase# ./esPutEmojiNeo4jMariaDB.py -i ukrainewar -d 14
+Total time 102.6628189086914 seconds
+root@alex:/disco2/keyphrase# ./esPutEmojiNeo4jMariaDB.py -i ukrainewar -d 15
+Total time 176.94876956939697 seconds
+root@alex:/disco2/keyphrase# ./esPutEmojiNeo4jMariaDB.py -i ukrainewar -d 16
+Total time 87.12520337104797 seconds
+root@alex:/disco2/keyphrase# ./esPutEmojiNeo4jMariaDB.py -i ukrainewar -d 17
+Total time 70.63379120826721 seconds
+root@alex:/disco2/keyphrase# ./esPutEmojiNeo4jMariaDB.py -i ukrainewar -d 18
+Total time 64.12947297096252 seconds
+root@alex:/disco2/keyphrase# ./esPutEmojiNeo4jMariaDB.py -i ukrainewar -d 19
+Total time 65.86728835105896 seconds
+root@alex:/disco2/keyphrase# ./esPutEmojiNeo4jMariaDB.py -i ukrainewar -d 20
+Total time 70.63074731826782 seconds
+root@alex:/disco2/keyphrase# ./esPutEmojiNeo4jMariaDB.py -i ukrainewar -d 21
+Total time 75.07004165649414 seconds
+root@alex:/disco2/keyphrase# ./esPutEmojiNeo4jMariaDB.py -i ukrainewar -d 22
+Total time 79.42803955078125 seconds
+root@alex:/disco2/keyphrase# ./esPutEmojiNeo4jMariaDB.py -i ukrainewar -d 23
+Total time 80.24001622200012 seconds
+root@alex:/disco2/keyphrase# ./esPutEmojiNeo4jMariaDB.py -i ukrainewar -d 24
+Total time 200.93281865119934 seconds
+root@alex:/disco2/keyphrase# ./esPutEmojiNeo4jMariaDB.py -i ukrainewar -d 25
+Total time 164.97504425048828 seconds
+root@alex:/disco2/keyphrase# ./esPutEmojiNeo4jMariaDB.py -i ukrainewar -d 26
+Total time 130.68259143829346 seconds
+root@alex:/disco2/keyphrase# ./esPutEmojiNeo4jMariaDB.py -i ukrainewar -d 27
+Total time 167.60756087303162 seconds
+root@alex:/disco2/keyphrase# ./esPutEmojiNeo4jMariaDB.py -i ukrainewar -d 28
+Total time 155.12149047851562 seconds
+root@alex:/disco2/keyphrase# ./esPutEmojiNeo4jMariaDB.py -i ukrainewar -d 29
+Total time 46.44576907157898 seconds
+root@alex:/disco2/keyphrase# ./esPutEmojiNeo4jMariaDB.py -i ukrainewar -d 30
+Total time 50.06647801399231 seconds
+root@alex:/disco2/keyphrase# ./esPutEmojiNeo4jMariaDB.py -i ukrainewar -d 31
+Total time 27.242722988128662 seconds
+
+################################################ ##############
+# Confirm, in Neo4j
+MATCH (n) RETURN SUM(n.ukrainewar)
+4478831
+
+################################################ ##############
+# Confirm, in MariaDB
+MariaDB [emojis]> SELECT SUM(emp_count) FROM emoji_project JOIN project ON pro_id=emp_proid AND pro_name='ukrainewar';
++----------------+
+| SUM(emp_count) |
++----------------+
+| 4478831 |
++----------------+
+1 row in set (0.008 sec)
+
+######################################################
+# Pass co-occurrences to MariaDB
+# For UKRAINEWAR, each day must be passed separately, as there is a lot of data
+
+./esPutMariaDB.py -i ukrainewar -d 1
+./esPutMariaDB.py -i ukrainewar -d 2
+./esPutMariaDB.py -i ukrainewar -d 3
+./esPutMariaDB.py -i ukrainewar -d 4
+./esPutMariaDB.py -i ukrainewar -d 5
+./esPutMariaDB.py -i ukrainewar -d 6
+./esPutMariaDB.py -i ukrainewar -d 7
+./esPutMariaDB.py -i ukrainewar -d 8
+./esPutMariaDB.py -i ukrainewar -d 9
+./esPutMariaDB.py -i ukrainewar -d 10
+./esPutMariaDB.py -i ukrainewar -d 11
+./esPutMariaDB.py -i ukrainewar -d 12
+./esPutMariaDB.py -i ukrainewar -d 13
+./esPutMariaDB.py -i ukrainewar -d 14
+./esPutMariaDB.py -i ukrainewar -d 15
+./esPutMariaDB.py -i ukrainewar -d 16
+./esPutMariaDB.py -i ukrainewar -d 17
+./esPutMariaDB.py -i ukrainewar -d 18
+./esPutMariaDB.py -i ukrainewar -d 19
+./esPutMariaDB.py -i ukrainewar -d 20
+./esPutMariaDB.py -i ukrainewar -d 21
+./esPutMariaDB.py -i ukrainewar -d 22
+./esPutMariaDB.py -i ukrainewar -d 23
+./esPutMariaDB.py -i ukrainewar -d 24
+./esPutMariaDB.py -i ukrainewar -d 25
+./esPutMariaDB.py -i ukrainewar -d 26
+./esPutMariaDB.py -i ukrainewar -d 27
+./esPutMariaDB.py -i ukrainewar -d 28
+./esPutMariaDB.py -i ukrainewar -d 29
+./esPutMariaDB.py -i ukrainewar -d 30
+./esPutMariaDB.py -i ukrainewar -d 31
+
+################################################ ##############
+# Times that the previous commands took:
+
+root@alex:/disco2/keyphrase# ./esPutMariaDB.py -i ukrainewar -d 1
+Total time 30.635167360305786 seconds
+root@alex:/disco2/keyphrase# ./esPutMariaDB.py -i ukrainewar -d 2
+Total time 23.58681559562683 seconds
+root@alex:/disco2/keyphrase# ./esPutMariaDB.py -i ukrainewar -d 3
+Total time 9.504505157470703 seconds
+root@alex:/disco2/keyphrase# ./esPutMariaDB.py -i ukrainewar -d 4
+Total time 9.132685422897339 seconds
+root@alex:/disco2/keyphrase# ./esPutMariaDB.py -i ukrainewar -d 5
+Total time 17.494038343429565 seconds
+root@alex:/disco2/keyphrase# ./esPutMariaDB.py -i ukrainewar -d 6
+Total time 23.693835973739624 seconds
+root@alex:/disco2/keyphrase# ./esPutMariaDB.py -i ukrainewar -d 7
+Total time 13.471343517303467 seconds
+root@alex:/disco2/keyphrase# ./esPutMariaDB.py -i ukrainewar -d 8
+Total time 15.065214157104492 seconds
+root@alex:/disco2/keyphrase# ./esPutMariaDB.py -i ukrainewar -d 9
+Total time 12.750727415084839 seconds
+root@alex:/disco2/keyphrase# ./esPutMariaDB.py -i ukrainewar -d 10
+Total time 13.294023990631104 seconds
+root@alex:/disco2/keyphrase# ./esPutMariaDB.py -i ukrainewar -d 11
+Total time 13.01756763458252 seconds
+root@alex:/disco2/keyphrase# ./esPutMariaDB.py -i ukrainewar -d 12
+Total time 14.091779947280884 seconds
+root@alex:/disco2/keyphrase# ./esPutMariaDB.py -i ukrainewar -d 13
+Total time 14.174209117889404 seconds
+root@alex:/disco2/keyphrase# ./esPutMariaDB.py -i ukrainewar -d 14
+Total time 15.15383791923523 seconds
+root@alex:/disco2/keyphrase# ./esPutMariaDB.py -i ukrainewar -d 15
+Total time 30.718515157699585 seconds
+root@alex:/disco2/keyphrase# ./esPutMariaDB.py -i ukrainewar -d 16
+Total time 13.189566373825073 seconds
+root@alex:/disco2/keyphrase# ./esPutMariaDB.py -i ukrainewar -d 17
+Total time 11.550443887710571 seconds
+root@alex:/disco2/keyphrase# ./esPutMariaDB.py -i ukrainewar -d 18
+Total time 11.261658430099487 seconds
+root@alex:/disco2/keyphrase# ./esPutMariaDB.py -i ukrainewar -d 19
+Total time 11.669078588485718 seconds
+root@alex:/disco2/keyphrase# ./esPutMariaDB.py -i ukrainewar -d 20
+Total time 17.67741084098816 seconds
+root@alex:/disco2/keyphrase# ./esPutMariaDB.py -i ukrainewar -d 21
+Total time 24.789870023727417 seconds
+root@alex:/disco2/keyphrase# ./esPutMariaDB.py -i ukrainewar -d 22
+Total time 21.806971788406372 seconds
+root@alex:/disco2/keyphrase# ./esPutMariaDB.py -i ukrainewar -d 23
+Total time 23.14859127998352 seconds
+root@alex:/disco2/keyphrase# ./esPutMariaDB.py -i ukrainewar -d 24
+Total time 50.47624063491821 seconds
+root@alex:/disco2/keyphrase# ./esPutMariaDB.py -i ukrainewar -d 25
+Total time 66.72404193878174 seconds
+root@alex:/disco2/keyphrase# ./esPutMariaDB.py -i ukrainewar -d 26
+Total time 51.58514928817749 seconds
+root@alex:/disco2/keyphrase# ./esPutMariaDB.py -i ukrainewar -d 27
+Total time 29.646299123764038 seconds
+root@alex:/disco2/keyphrase# ./esPutMariaDB.py -i ukrainewar -d 28
+Total time 25.232189416885376 seconds
+root@alex:/disco2/keyphrase# ./esPutMariaDB.py -i ukrainewar -d 29
+Total time 9.60123896598816 seconds
+root@alex:/disco2/keyphrase# ./esPutMariaDB.py -i ukrainewar -d 30
+Total time 10.491641759872437 seconds
+root@alex:/disco2/keyphrase# ./esPutMariaDB.py -i ukrainewar -d 31
+Total time 3.966346502304077 seconds
+
+######################################################
+# Confirm in MariaDB
+
+SELECT COUNT(*) FROM follow WHERE fol_index='ukrainewar';
++----------+
+| COUNT(*) |
++----------+
+| 1044788 |
++----------+
+1 row in set (0.296 sec)
+
+
+# After loading all the data into the FOLLOW table, run the following SQL:
+UPDATE follow SET fol_hour=HOUR(fol_created_at) WHERE fol_hour IS NULL;
+UPDATE follow SET fol_day=DAY(fol_created_at) WHERE fol_day IS NULL;
+
+MariaDB [emojis]> UPDATE follow SET fol_hour=HOUR(fol_created_at) WHERE fol_hour IS NULL;
+Query OK, 1044788 rows affected (19,609 sec)
+Rows matched: 1044788 Changed: 1044788 Warnings: 0
+
+MariaDB [emojis]> UPDATE follow SET fol_day=DAY(fol_created_at) WHERE fol_day IS NULL;
+Query OK, 1044788 rows affected (31,540 sec)
+Rows matched: 1044788 Changed: 1044788 Warnings: 0
+
+################################################ ####
+# Pass co-occurrences to neo4j
+
+./mdbPutNeoFollow.py -i ukrainewar
+Total time 617.4372098445892 seconds
+
+# Confirm that everything is ok in neo4j
+MATCH (n)-[r:FOLLOWED_BY { index: "ukrainewar" }]->(m) RETURN COUNT(r)
+1044788
+
+################################################ ####
+# To add keyphrases to neo4j, in summary form for each co-occurrence
+#-------------------------------------
+# With MariaDB it seems to be faster
+cd /disco2/keyphrase
+./esPutMariaDBKeyphrase.py -i ukrainewar
+Total time 1089.5557017326355 seconds
+
+#-------------------------------------
+# The previous procedure can be slow, so in MariaDB, you can follow the evolution:
+# Number of entries in KEYPHRASE
+SELECT COUNT(*) FROM keyphrase WHERE key_index='ukrainewar';
++----------+
+| COUNT(*) |
++----------+
+| 77484 |
++----------+
+1 row in set (0.037 sec)
+
+# Number of entries already processed and already in PHRASE
+SELECT COUNT(DISTINCT phr_keyid) FROM phrase WHERE phr_keyid IN (SELECT key_id FROM keyphrase WHERE key_index='ukrainewar');
++---------------------------+
+| COUNT(DISTINCT phr_keyid) |
++---------------------------+
+| 74527 |
++---------------------------+
+1 row in set (0.711 sec)
+
+#----------------------------------------------
+# Put the counts in key_count
+# I had to do this, to have the count at hand, and not have to count at the moment
+# This makes it easier to sort in descending counting order, particularly when searching between dates
+# NOTE: this is the count of how many co-occurrences there are of a given pair of emojis (between two dates, or without date limit, depends on each case)
+# NOTE2: I don't know if this particular script is prepared to work with dates - CONFIRM
+
+./mdbPutKeyphraseCountByIndex.py -i ukrainewar
+Total time 328.9960606098175 seconds
+
+#--------------------------------------------------
+# Pass Keyphrases from MariaDB to Neo4j
+
+./mdbPutNeoKeyphrase.py -i ukrainewar
+Total time 45.83591890335083 seconds
+
+################################################ ####
+Place IDF fields in MariaDB's PHRASE table
+
+./mdbPutIDF.py -i ukrainewar
+Total time 2735.5141417980194 seconds
+
+################################################ ####
+# Update the phr_tfidf field
+
+mysql
+\remojis
+UPDATE phrase SET phr_tfidf=phr_count*phr_idf WHERE phr_tfidf IS NULL;
+
+MariaDB [emojis]> UPDATE phrase SET phr_tfidf=phr_count*phr_idf WHERE phr_tfidf IS NULL;
+Query OK, 1545380 rows affected (26,559 sec)
+Rows matched: 1545380 Changed: 1545380 Warnings: 0
+
+#----------------------------------------------------
+# Same for the phr_weightidf field
+
+mysql
+\remojis
+UPDATE phrase SET phr_weightidf=phr_weight*phr_idf WHERE phr_weightidf IS NULL;
+
+MariaDB [emojis]> UPDATE phrase SET phr_weightidf=phr_weight*phr_idf WHERE phr_weightidf IS NULL;
+Query OK, 1545380 rows affected (28,319 sec)
+Rows matched: 1545380 Changed: 1545380 Warnings: 0
+
+#--------------------------------------------------
+# Pass Keyphrases from MariaDB to Neo4j - but now, ordered by phr_weightidf DESC
+
+./mdbPutNeoIdfKeyphrase.py -i ukrainewar
+Total time 44.96714210510254 seconds
+
+
+################################################ ################################
+# Counts
+################################################ ################################
+
+################################################ ################################
+# Count the total number of co-occurrences in ElasticSearch
+
+cd /disco2/keyphrase
+./esCountEmojiCO.py -i ukrainewar -o text
+Total co-occurrences: 1561896
+Total time 120.14261174201965 seconds
+
+################################################ ################################
+# Count the total number of co-occurrences in Neo4j
+
+#---------------------------------
+# Total co-occurrences, excluding repetitions within the same tweet
+#---------------------------------
+MATCH (n)-[r:FOLLOWED_BY { index: "ukrainewar" }]->(m) RETURN COUNT(r)
+1044788
+
+#---------------------------------
+# Total co-occurrences, including repetitions within the same tweet
+#---------------------------------
+MATCH (n)-[r:FOLLOWED_BY { index: "ukrainewar" }]->(m) RETURN SUM(r.count)
+1561896
+
+#---------------------------------
+# Total co-occurrences, excluding repetitions. Only the number of co-occurrences, i.e., unique sequences of 2 emojis present in the dataset
+#---------------------------------
+MATCH (n)-[r:KEYPHRASES { index: "ukrainewar" }]->(m) RETURN COUNT(r);
+77484
+
+################################################ ################################
+# Count the total number of co-occurrences in MariaDB
+
+#---------------------------------
+# Total co-occurrences, excluding repetitions within the same tweet
+#---------------------------------
+
+MariaDB [emojis]> SELECT COUNT(*) FROM follow WHERE fol_index='ukrainewar';
++----------+
+| COUNT(*) |
++----------+
+| 1044788 |
++----------+
+1 row in set (0.367 sec)
+
+#---------------------------------
+# Total co-occurrences, including repetitions within the same tweet
+#---------------------------------
+
+MariaDB [emojis]> SELECT SUM(fol_count) FROM follow WHERE fol_index='ukrainewar';
++----------------+
+| SUM(fol_count) |
++----------------+
+| 1561896 |
++----------------+
+
+#--------------------------
+# For keyphrase table
+
+MariaDB [emojis]> SELECT COUNT(*) FROM keyphrase WHERE key_index='ukrainewar';
++----------+
+| COUNT(*) |
++----------+
+| 77484 |
++----------+
+1 row in set (0.060 sec)
+
+
+MariaDB [emojis]> SELECT COUNT(*) FROM phrase WHERE phr_keyid IN (SELECT key_id FROM keyphrase WHERE key_index='ukrainewar');
++----------+
+| COUNT(*) |
++----------+
+| 1545380 |
++----------+
+1 row in set (0.519 sec)
+
+
+MATCH (n)-[r:KEYPHRASES { index: "ukrainewar" }]->(m) RETURN COUNT(r);
+77484
+
+####################################################################################
+# emojis-co-occurrence-50-most-used (results are in a file with the name: emojis-co-occurrence-50-most-used.txt)
+
+#-----------------------------------------------
+# Indifferent
+MATCH (n)-[r:FOLLOWED_BY { index: "ukrainewar" }]->(m) RETURN n.emoji,n.name,m.emoji,m.name,SUM(r.count) ORDER BY SUM(r .count) DESC LIMIT 50;
+
+#-----------------------------------------------
+# With repetition
+MATCH (n)-[r:FOLLOWED_BY { index: "ukrainewar" }]->(m) WHERE n.emoji = m.emoji RETURN n.emoji,n.name,m.emoji,m.name,SUM(r .count) ORDER BY SUM(r.count) DESC LIMIT 50;
+
+#-----------------------------------------------
+# No repetition
+MATCH (n)-[r:FOLLOWED_BY { index: "ukrainewar" }]->(m) WHERE n.emoji <> m.emoji RETURN n.emoji,n.name,m.emoji,m.name,SUM( r.count) ORDER BY SUM(r.count) DESC LIMIT 50;
+
+#-----------------------------------------------
+# No repetition and independent of order
+MATCH (n)-[r:FOLLOWED_BY { index: "ukrainewar" }]-(m) WHERE n.emoji <> m.emoji AND ID(n) < ID(m) RETURN n.emoji,n.name,m .emoji,m.name,SUM(r.count) ORDER BY SUM(r.count) DESC LIMIT 50;
+
+
+################################################ ######################
+# Count number of tweets
+################################################ ######################
+
+#-------------------------------------------
+# Original tweets, (no retweets or quoted tweets)
+#-------------------------------------------
+curl -H "Content-Type: application/json" -XGET '127.0.0.1:9200/ukrainewar/_count?pretty' -d '
+{
+   "query": {
+     "bool": {
+       "must": [
+         {
+           "match": {
+             "original_field": "text"
+           }
+         }
+       ]
+     }
+   }
+}
+'
+{
+   "count" : 9323888,
+   "_shards" : {
+     "total" : 1,
+     "successful" : 1,
+     "skipped" : 0,
+     "failed" : 0
+   }
+}
+
+
+#-------------------------------------------
+# All Tweets (comm retweets, and quoted tweets)
+#-------------------------------------------
+curl -H "Content-Type: application/json" -XGET '127.0.0.1:9200/ukrainewar/_count?pretty'
+{
+   "count" : 45068599,
+   "_shards" : {
+     "total" : 1,
+     "successful" : 1,
+     "skipped" : 0,
+     "failed" : 0
+   }
+}
+
+################################################ ######################
+# Count the total number of emojis
+################################################ ######################
+
+#-------------------------------------------
+# Total number of emojis in all tweets (including text, rtext and qtext)
+#-------------------------------------------
+curl -H "Content-Type: application/json" -XGET '127.0.0.1:9200/ukrainewar/_search?pretty' -d '
+{
+   "query": {"match_all": {}
+   }
+, "size": 0,
+"aggs" : {
+"sum": {
+"sum": {"field" : "n_emoji"}
+}
+}
+}
+'
+{
+   "took" : 1597,
+   "timed_out" : false,
+   "_shards" : {
+     "total" : 1,
+     "successful" : 1,
+     "skipped" : 0,
+     "failed" : 0
+   },
+   "hits" : {
+     "total" : {
+       "value" : 10000,
+       "relation" : "gte"
+     },
+     "max_score" : null,
+     "hits" : [ ]
+   },
+   "aggregations" : {
+     "sum" : {
+       "value" : 2.2319282E7
+     }
+   }
+}
+
+#-------------------------------------------
+# Total number of emojis in original tweets (text type only, excluding rtext and qtext)
+#-------------------------------------------
+curl -H "Content-Type: application/json" -XGET '127.0.0.1:9200/ukrainewar/_search?pretty' -d '
+{
+   "query": {
+     "bool": {
+       "must": [
+         {
+           "match": {
+             "original_field": "text"
+           }
+         }
+       ]
+     }
+   }, "size": 0,
+"aggs" : {
+"sum": {
+"sum": {"field" : "n_emoji"}
+}
+}
+}
+'
+{
+   "took": 527,
+   "timed_out" : false,
+   "_shards" : {
+     "total" : 1,
+     "successful" : 1,
+     "skipped" : 0,
+     "failed" : 0
+   },
+   "hits" : {
+     "total" : {
+       "value" : 10000,
+       "relation" : "gte"
+     },
+     "max_score" : null,
+     "hits" : [ ]
+   },
+   "aggregations" : {
+     "sum" : {
+       "value" : 4478831.0
+     }
+   }
+}
+
+
+#-------------------------------------------
+# Confirmation in MariaDB
+#-------------------------------------------
+MariaDB [emojis]> SELECT SUM(emp_count) FROM emoji_project JOIN project ON emp_proid=pro_id WHERE pro_name='ukrainewar';
++----------------+
+| SUM(emp_count) |
++----------------+
+| 4478831 |
++----------------+
+1 row in set (0.018 sec)
+
+################################################ ######################
+# Maximum and minimum date of tweets
+################################################ ######################
+
+curl -X POST "localhost:9200/ukrainewar/_search?size=0&pretty" -H 'Content-Type: application/json' -d'
+{
+"aggs" : {
+        "min_date": {"min": {"field": "created_at"}},
+        "max_date": {"max": {"field": "created_at"}}
+     }
+}
+'
+{
+   "took" : 258,
+   "timed_out" : false,
+   "_shards" : {
+     "total" : 1,
+     "successful" : 1,
+     "skipped" : 0,
+     "failed" : 0
+   },
+   "hits" : {
+     "total" : {
+       "value" : 10000,
+       "relation" : "gte"
+     },
+     "max_score" : null,
+     "hits" : [ ]
+   },
+   "aggregations" : {
+     "max_date" : {
+       "value" : 1.658835141E12,
+       "value_as_string" : "2022-07-26T11:32:21.000Z"
+     },
+     "min_date" : {
+       "value" : 1.645386406E12,
+       "value_as_string" : "2022-02-20T19:46:46.000Z"
+     }
+   }
+}
+
+################################################ ######################
+# Summary tables
+################################################ ######################
+
+#-------------------------------------------
+# Prominent emojis - closeness
+#-------------------------------------------
+http://localhost/distance.php?index=ukrainewar
+
+#-------------------------------------------
+# Top 50
+#-------------------------------------------
+http://localhost/top50.php?index=ukrainewar
+
+#-------------------------------------------
+# Top 50 IDF
+#-------------------------------------------
+http://localhost/top50idf.php?index=ukrainewar
+
+

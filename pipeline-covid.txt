@@ -1,0 +1,893 @@
+######################################################
+Complete pipeline with all the information
+######################################################
+# Pipeline for COVID:
+
+cd /disco2/keyphrase
+./unzip.py -d /disco2/COVID/tweets
+./proc_tweets.py -d /disco2/COVID/tweets
+./ngo.sh /disco2/COVID/tweets
+./creat_tw.py -d /disco2/COVID/tweets
+
+#############################################################
+# Restart ElasticSearch on Ubuntu
+
+service elasticsearch restart
+
+################################################################
+# Allow an ElasticSearch scroll to live for 30 days. The default is 1 day (24h)
+# https://www.elastic.co/guide/en/elasticsearch/reference/current/cluster-update-settings.html
+#
+# As I make a query to get all the records, this may cause a timeout.
+# To do this, you need to use the scroll and timeout parameters in the "elasticsearch.helpers.scan" function
+# https://www.elastic.co/guide/en/elasticsearch/reference/current/paginate-search-results.html#scroll-search-context
+# https://www.elastic.co/guide/en/elasticsearch/reference/current/common-options.html#time-units
+# https://github.com/elastic/elasticsearch-dsl-py/issues/796
+# https://stackoverflow.com/questions/33301119/error-with-elasticsearch-helpers-scan-api-when-using-query-parameter
+
+curl -X PUT "localhost:9200/_cluster/settings" -H 'Content-Type: application/json' -d'
+{
+  "persistent" : {
+    "search.max_keep_alive" : "30d"
+  }
+}
+'
+################################################################
+### Delete previous records, if necessary
+### curl -H "Content-Type: application/json" -XDELETE 127.0.0.1:9200/covid
+
+# Create the mapping
+# Create a field in elasticsearch for searches by 24 different processors, to allow multiprocessing when loading neo4j
+# Create a field in elasticsearch to process data for different days, from 1 to 31
+# Create a field in elasticsearch to store the sum of emojis in the emojis array
+
+curl -H "Content-Type: application/json" -XPUT 127.0.0.1:9200/covid -d '
+{
+	"mappings": {
+		"properties": {
+			"id_str": {"type": "long"}, 
+			"created_at": {"type": "date"}, 
+			"text": {"type": "text"}, 
+			"emoji": {
+				"type": "text", 
+				"fields": { "keyword": { "type": "keyword" } }
+			},
+			"id24": {"type": "long"},
+			"id31": {"type": "long"},
+			"n_emoji": {"type": "long"}
+		 }
+	}
+}
+'
+
+# Confirm the mapping
+curl -H "Content-Type: application/json" -XGET '127.0.0.1:9200/covid/_mapping?pretty'
+
+mkdir /disco5/COVID
+mkdir /disco5/COVID/tweets
+rsync -zarv  --prune-empty-dirs --include "*/"  --include="*.tw" --exclude="*" "/disco2/COVID/tweets/" "/disco5/COVID/tweets/"
+
+cd /disco2/keyphrase
+./read2ES.py -i covid -d /disco5/COVID/tweets/2020-01
+./read2ES.py -i covid -d /disco5/COVID/tweets/2020-02
+./read2ES.py -i covid -d /disco5/COVID/tweets/2020-03
+./read2ES.py -i covid -d /disco5/COVID/tweets/2020-04
+./read2ES.py -i covid -d /disco5/COVID/tweets/2020-05
+./read2ES.py -i covid -d /disco5/COVID/tweets/2020-06
+./read2ES.py -i covid -d /disco5/COVID/tweets/2020-07
+./read2ES.py -i covid -d /disco5/COVID/tweets/2020-08
+./read2ES.py -i covid -d /disco5/COVID/tweets/2020-09
+./read2ES.py -i covid -d /disco5/COVID/tweets/2020-10
+./read2ES.py -i covid -d /disco5/COVID/tweets/2020-11
+./read2ES.py -i covid -d /disco5/COVID/tweets/2020-12
+./read2ES.py -i covid -d /disco5/COVID/tweets/2021-01
+
+
+# Confirm insertion
+curl -H "Content-Type: application/json" -XGET '127.0.0.1:9200/covid/_count?pretty'
+{
+  "count" : 963167162,
+  "_shards" : {
+    "total" : 1,
+    "successful" : 1,
+    "skipped" : 0,
+    "failed" : 0
+  }
+}
+
+rm -r /disco5/COVID/
+
+################################################################
+# Create 31 groups - one for each day of the month - within the CLIMATE index, to then process each day separately
+# Create 24 groups - one for each hour of the day - within the CLIMATE index, and then assign them to 24 processors
+# It took 214480143 millis to update, there are 963167162 entries in elasticsearch
+# Fill in the n_emoji field with the sum of the emojis in the document
+curl -X POST "localhost:9200/covid/_update_by_query?pretty" -H 'Content-Type: application/json' -d'
+{
+"query": {"match_all": {}
+         },
+"script": "ctx._source.id31 = Integer.parseInt(ctx._source.created_at.substring(8,10)); ctx._source.id24 = Integer.parseInt(ctx._source.created_at.substring(11,13)); ctx._source.n_emoji = ctx._source.emoji.length"
+}
+'
+
+#--------------------------------------------------------
+# Monitor the evolution of previous code
+
+# Count docs without id24
+curl -X POST "localhost:9200/covid/_count?pretty" -H 'Content-Type: application/json' -d'
+{
+"query": {
+	"bool": {
+		"must_not": [
+			{
+				"exists": {
+					"field": "id24"
+					}
+				}
+			]
+		}	
+	}
+}
+'
+
+# Count docs with id24
+curl -X POST "localhost:9200/covid/_count?pretty" -H 'Content-Type: application/json' -d'
+{
+"query": {
+	"bool": {
+		"must": [
+			{
+				"exists": {
+					"field": "id24"
+					}
+				}
+			]
+		}	
+	}
+}
+'
+
+
+################################################ ####
+# I have to increase the number of possible ES answers. I may have to do this several times until the command below stops giving an error.
+curl -X PUT "localhost:9200/_settings" -H 'Content-Type: application/json' -d'
+{
+   "index.max_result_window": 2000000000
+}
+'
+
+################################################ ####
+# Launch neo4j:
+
+/usr/local/neo4j/bin/neo4j console
+
+# Put all emojis in Neo4j and MariaDB
+# In Neo4j, add the "n.covid" property to each emoji, with the number of occurrences of that emoji
+cd /disco2/keyphrase
+./esPutEmojiNeo4jMariaDB.py -i covid -d 1
+./esPutEmojiNeo4jMariaDB.py -i covid -d 2
+./esPutEmojiNeo4jMariaDB.py -i covid -d 3
+./esPutEmojiNeo4jMariaDB.py -i covid -d 4
+./esPutEmojiNeo4jMariaDB.py -i covid -d 5
+./esPutEmojiNeo4jMariaDB.py -i covid -d 6
+./esPutEmojiNeo4jMariaDB.py -i covid -d 7
+./esPutEmojiNeo4jMariaDB.py -i covid -d 8
+./esPutEmojiNeo4jMariaDB.py -i covid -d 9
+./esPutEmojiNeo4jMariaDB.py -i covid -d 10
+./esPutEmojiNeo4jMariaDB.py -i covid -d 11
+./esPutEmojiNeo4jMariaDB.py -i covid -d 12
+./esPutEmojiNeo4jMariaDB.py -i covid -d 13
+./esPutEmojiNeo4jMariaDB.py -i covid -d 14
+./esPutEmojiNeo4jMariaDB.py -i covid -d 15
+./esPutEmojiNeo4jMariaDB.py -i covid -d 16
+./esPutEmojiNeo4jMariaDB.py -i covid -d 17
+./esPutEmojiNeo4jMariaDB.py -i covid -d 18
+./esPutEmojiNeo4jMariaDB.py -i covid -d 19
+./esPutEmojiNeo4jMariaDB.py -i covid -d 20
+./esPutEmojiNeo4jMariaDB.py -i covid -d 21
+./esPutEmojiNeo4jMariaDB.py -i covid -d 22
+./esPutEmojiNeo4jMariaDB.py -i covid -d 23
+./esPutEmojiNeo4jMariaDB.py -i covid -d 24
+./esPutEmojiNeo4jMariaDB.py -i covid -d 25
+./esPutEmojiNeo4jMariaDB.py -i covid -d 26
+./esPutEmojiNeo4jMariaDB.py -i covid -d 27
+./esPutEmojiNeo4jMariaDB.py -i covid -d 28
+./esPutEmojiNeo4jMariaDB.py -i covid -d 29
+./esPutEmojiNeo4jMariaDB.py -i covid -d 30
+./esPutEmojiNeo4jMariaDB.py -i covid -d 31
+
+################################################ ##############
+# Times that the previous commands took:
+
+./esPutEmojiNeo4jMariaDB.py -i covid -d 1
+Total time 931.5668046474457 seconds
+./esPutEmojiNeo4jMariaDB.py -i covid -d 2
+Total time 882.7731988430023 seconds
+./esPutEmojiNeo4jMariaDB.py -i covid -d 3
+Total time 1007.7639393806458 seconds
+./esPutEmojiNeo4jMariaDB.py -i covid -d 4
+Total time 1079.2378778457642 seconds
+./esPutEmojiNeo4jMariaDB.py -i covid -d 5
+Total time 959.7644100189209 seconds
+./esPutEmojiNeo4jMariaDB.py -i covid -d 6
+Total time 793.4699187278748 seconds
+./esPutEmojiNeo4jMariaDB.py -i covid -d 7
+Total time 860.6951470375061 seconds
+./esPutEmojiNeo4jMariaDB.py -i covid -d 8
+Total time 828.3734183311462 seconds
+./esPutEmojiNeo4jMariaDB.py -i covid -d 9
+Total time 793.0783758163452 seconds
+./esPutEmojiNeo4jMariaDB.py -i covid -d 10
+Total time 806.7963402271271 seconds
+./esPutEmojiNeo4jMariaDB.py -i covid -d 11
+Total time 844.1781265735626 seconds
+./esPutEmojiNeo4jMariaDB.py -i covid -d 12
+Total time 798.8503715991974 seconds
+./esPutEmojiNeo4jMariaDB.py -i covid -d 13
+Total time 803.1146628856659 seconds
+./esPutEmojiNeo4jMariaDB.py -i covid -d 14
+Total time 823.8308889865875 seconds
+./esPutEmojiNeo4jMariaDB.py -i covid -d 15
+Total time 796.0717396736145 seconds
+./esPutEmojiNeo4jMariaDB.py -i covid -d 16
+Total time 794.0087840557098 seconds
+./esPutEmojiNeo4jMariaDB.py -i covid -d 17
+Total time 788.3893914222717 seconds
+./esPutEmojiNeo4jMariaDB.py -i covid -d 18
+Total time 832.3816986083984 seconds
+./esPutEmojiNeo4jMariaDB.py -i covid -d 19
+Total time 832.5212848186493 seconds
+./esPutEmojiNeo4jMariaDB.py -i covid -d 20
+Total time 867.6860480308533 seconds
+./esPutEmojiNeo4jMariaDB.py -i covid -d 21
+Total time 813.8036642074585 seconds
+./esPutEmojiNeo4jMariaDB.py -i covid -d 22
+Total time 797.3105435371399 seconds
+./esPutEmojiNeo4jMariaDB.py -i covid -d 23
+Total time 778.8196642398834 seconds
+./esPutEmojiNeo4jMariaDB.py -i covid -d 24
+Total time 870.6407837867737 seconds
+./esPutEmojiNeo4jMariaDB.py -i covid -d 25
+Total time 825.3478553295135 seconds
+./esPutEmojiNeo4jMariaDB.py -i covid -d 26
+Total time 795.4458937644958 seconds
+./esPutEmojiNeo4jMariaDB.py -i covid -d 27
+Total time 869.0257720947266 seconds
+./esPutEmojiNeo4jMariaDB.py -i covid -d 28
+Total time 869.6450834274292 seconds
+./esPutEmojiNeo4jMariaDB.py -i covid -d 29
+Total time 924.0083601474762 seconds
+./esPutEmojiNeo4jMariaDB.py -i covid -d 30
+Total time 974.3748619556427 seconds
+./esPutEmojiNeo4jMariaDB.py -i covid -d 31
+Total time 444.2953474521637 seconds
+
+################################################ ##############
+# Confirm, in Neo4j
+MATCH (n) RETURN SUM(n.covid)
+89114449
+
+################################################ ##############
+# Confirm, in MariaDB
+MariaDB [emojis]> SELECT SUM(emp_count) FROM emoji_project JOIN project ON pro_id=emp_proid AND pro_name='covid';
++----------------+
+| SUM(emp_count) |
++----------------+
+| 89114449 |
++----------------+
+1 row in set (0.022 sec)
+
+################################################ ####
+# Pass co-occurrences to MariaDB
+# For COVID, the days have to be spent separately, as there is a lot of data
+
+./esPutMariaDB.py -i covid -d 1
+./esPutMariaDB.py -i covid -d 2
+./esPutMariaDB.py -i covid -d 3
+./esPutMariaDB.py -i covid -d 4
+./esPutMariaDB.py -i covid -d 5
+./esPutMariaDB.py -i covid -d 6
+./esPutMariaDB.py -i covid -d 7
+./esPutMariaDB.py -i covid -d 8
+./esPutMariaDB.py -i covid -d 9
+./esPutMariaDB.py -i covid -d 10
+./esPutMariaDB.py -i covid -d 11
+./esPutMariaDB.py -i covid -d 12
+./esPutMariaDB.py -i covid -d 13
+./esPutMariaDB.py -i covid -d 14
+./esPutMariaDB.py -i covid -d 15
+./esPutMariaDB.py -i covid -d 16
+./esPutMariaDB.py -i covid -d 17
+./esPutMariaDB.py -i covid -d 18
+./esPutMariaDB.py -i covid -d 19
+./esPutMariaDB.py -i covid -d 20
+./esPutMariaDB.py -i covid -d 21
+./esPutMariaDB.py -i covid -d 22
+./esPutMariaDB.py -i covid -d 23
+./esPutMariaDB.py -i covid -d 24
+./esPutMariaDB.py -i covid -d 25
+./esPutMariaDB.py -i covid -d 26
+./esPutMariaDB.py -i covid -d 27
+./esPutMariaDB.py -i covid -d 28
+./esPutMariaDB.py -i covid -d 29
+./esPutMariaDB.py -i covid -d 30
+./esPutMariaDB.py -i covid -d 31
+
+################################################ ##############
+# Times that the previous commands took:
+
+./esPutMariaDB.py -i covid -d 1
+Total time 257.9672553539276 seconds
+./esPutMariaDB.py -i covid -d 2
+Total time 422.199373960495 seconds
+./esPutMariaDB.py -i covid -d 3
+Total time 444.682035446167 seconds
+./esPutMariaDB.py -i covid -d 4
+Total time 523.5031189918518 seconds
+./esPutMariaDB.py -i covid -d 5
+Total time 464.5026910305023 seconds
+./esPutMariaDB.py -i covid -d 6
+Total time 516.9861721992493 seconds
+./esPutMariaDB.py -i covid -d 7
+Total time 541.9935021400452 seconds
+./esPutMariaDB.py -i covid -d 8
+Total time 526.5015840530396 seconds
+./esPutMariaDB.py -i covid -d 9
+Total time 520.8917191028595 seconds
+./esPutMariaDB.py -i covid -d 10
+Total time 508.43055844306946 seconds
+./esPutMariaDB.py -i covid -d 11
+Total time 530.5926270484924 seconds
+./esPutMariaDB.py -i covid -d 12
+Total time 527.2669885158539 seconds
+./esPutMariaDB.py -i covid -d 13
+Total time 517.7268180847168 seconds
+./esPutMariaDB.py -i covid -d 14
+Total time 523.7195060253143 seconds
+./esPutMariaDB.py -i covid -d 15
+Total time 505.0009551048279 seconds
+./esPutMariaDB.py -i covid -d 16
+Total time 512.8636884689331 seconds
+./esPutMariaDB.py -i covid -d 17
+Total time 527.3521237373352 seconds
+./esPutMariaDB.py -i covid -d 18
+Total time 522.0374577045441 seconds
+./esPutMariaDB.py -i covid -d 19
+Total time 525.9846248626709 seconds
+./esPutMariaDB.py -i covid -d 20
+Total time 571.1119091510773 seconds
+./esPutMariaDB.py -i covid -d 21
+Total time 533.7117345333099 seconds
+./esPutMariaDB.py -i covid -d 22
+Total time 601.2206447124481 seconds
+./esPutMariaDB.py -i covid -d 23
+Total time 532.5662903785706 seconds
+./esPutMariaDB.py -i covid -d 24
+Total time 532.883297920227 seconds
+./esPutMariaDB.py -i covid -d 25
+Total time 537.1455502510071 seconds
+./esPutMariaDB.py -i covid -d 26
+Total time 517.5180113315582 seconds
+./esPutMariaDB.py -i covid -d 27
+Total time 555.9552037715912 seconds
+./esPutMariaDB.py -i covid -d 28
+Total time 548.8914930820465 seconds
+./esPutMariaDB.py -i covid -d 29
+Total time 604.5657396316528 seconds
+./esPutMariaDB.py -i covid -d 30
+Total time 636.1884825229645 seconds
+./esPutMariaDB.py -i covid -d 31
+Total time 228.89354872703552 seconds
+
+################################################ ####
+# Confirm in MariaDB
+
+SELECT COUNT(*) FROM follow WHERE fol_index='covid';
++----------+
+| COUNT(*) |
++----------+
+| 20812373 |
++----------+
+1 row in set (5,677 sec)
+
+
+# After loading all the data into the FOLLOW table, run the following SQL:
+UPDATE follow SET fol_hour=HOUR(fol_created_at) WHERE fol_hour IS NULL;
+UPDATE follow SET fol_day=DAY(fol_created_at) WHERE fol_day IS NULL;
+
+MariaDB [emojis]> UPDATE follow SET fol_hour=HOUR(fol_created_at) WHERE fol_hour IS NULL;
+Query OK, 20812373 rows affected (14 min 39,400 sec)
+Rows matched: 20812373 Changed: 20812373 Warnings: 0
+
+MariaDB [emojis]> UPDATE follow SET fol_day=DAY(fol_created_at) WHERE fol_day IS NULL;
+Query OK, 20812373 rows affected (19 min 3.889 sec)
+Rows matched: 20812373 Changed: 20812373 Warnings: 0
+
+################################################ ####
+# Pass co-occurrences to neo4j
+
+./mdbPutNeoFollow.py -i covid
+Total time 11374.385785341263 seconds
+
+# Confirm that everything is ok in neo4j
+MATCH (n)-[r:FOLLOWED_BY { index: "covid" }]->(m) RETURN COUNT(r)
+20812373
+
+################################################ ####
+# To add keyphrases to neo4j, in summary form for each co-occurrence
+#-------------------------------------
+# With MariaDB it seems to be faster
+cd /disco2/keyphrase
+./esPutMariaDBKeyphrase.py -i covid
+MySQL server has gone away --->>> REBENTOU <<<---
+Total time 31706.991238594055 seconds
+
+#------------------------------------- NOTES IN THE MARGIN - HOME ------ ----------
+# When it burst, it had:
+SELECT COUNT(*) FROM phrase WHERE phr_keyid IN (SELECT key_id FROM keyphrase WHERE key_index='covid');
++----------+
+| COUNT(*) |
++----------+
+| 17677019 |
++----------+
+1 row in set (4,440 sec)
+#------------------------------------- NOTES IN THE MARGIN - END ------ ----------
+
+# When it burst, I had to use:
+DELETE FROM helper;
+./esPutMariaDBKeyphrase-AUXILIAR.py -i covid
+
+#------------------------------------- NOTES IN THE MARGIN - HOME ------ ----------
+# After a few hours, I obtain the following values
+# It suggests that the problem is too many keyphrases associated with the repeated co-occurrence of the "face with tears of joy" emoji
+
+SELECT DISTINCT aux_keyid FROM auxiliary;
++-----------+
+| aux_keyid |
++-----------+
+| 455646 |
++-----------+
+1 row in set (0.002 sec)
+
+SELECT * FROM keyphrase WHERE key_id=455646;
++--------+---------------+-------------+---------- -+----------+----------------+--------------+----- ------+
+| key_id | key_emo_start | key_emo_end | key_index | key_id24 | key_date_start | key_date_end | key_count |
++--------+---------------+-------------+---------- -+----------+----------------+--------------+----- ------+
+| 455646 | 9 | 9 | covid | 6 | NULL | NULL | NULL |
++--------+---------------+-------------+---------- -+----------+----------------+--------------+----- ------+
+1 row in set (0.001 sec)
+
+SELECT * FROM emoji WHERE emo_id=9;
++--------+-----------+-----------------------+
+| emo_id | emo_emoji | emo_name |
++--------+-----------+-----------------------+
+| 9 | 😂 | face with tears of joy |
++--------+-----------+-----------------------+
+1 row in set (0.002 sec)
+#------------------------------------- NOTES IN THE MARGIN - END ------ ----------
+
+# Then, after 11h25m,
+# Check progress with:
+SELECT COUNT(*) FROM auxiliary;
+SELECT COUNT(*) FROM phrase WHERE phr_keyid IN (SELECT key_id FROM keyphrase WHERE key_index='covid');
+
+#------------------------------------- NOTES IN THE MARGIN - HOME ------ ----------
+# When COUNT(*) exceeded the previous value, which was 17677019; In this case, after 11h25m I obtained the following values:
+
+MariaDB [emojis]> SELECT COUNT(*) FROM phrase WHERE phr_keyid IN (SELECT key_id FROM keyphrase WHERE key_index='covid');
++----------+
+| COUNT(*) |
++----------+
+| 17696214 |
++----------+
+1 row in set (4,626 sec)
+
+MariaDB [emojis]> SELECT COUNT(*) FROM auxiliary;
++----------+
+| COUNT(*) |
++----------+
+| 3359417 |
++----------+
+1 row in set (1,393 sec)
+#------------------------------------- NOTES IN THE MARGIN - END ------ ----------
+# when the heavier calculation had already produced results for the phrase table, I did CTRL+C and resumed:
+./esPutMariaDBKeyphrase.py -i covid
+Total time 13578.888347148895 seconds
+
+
+#-------------------------------------
+# The previous procedure can be slow, so in MariaDB, you can follow the evolution:
+# MUST GIVE:
+SELECT COUNT(*) FROM phrase WHERE phr_keyid IN (SELECT key_id FROM keyphrase WHERE key_index='covid');
++----------+
+| COUNT(*) |
++----------+
+| 18444746 |
++----------+
+1 row in set (0.000 sec)
+
+#-------------------------------------
+# The previous procedure can be slow, so in MariaDB, you can follow the evolution:
+# Number of entries in KEYPHRASE
+SELECT COUNT(*) FROM keyphrase WHERE key_index='covid';
++----------+
+| COUNT(*) |
++----------+
+| 654124 |
++----------+
+1 row in set (0.181 sec)
+
+# Number of entries already processed and already in PHRASE
+SELECT COUNT(DISTINCT phr_keyid) FROM phrase WHERE phr_keyid IN (SELECT key_id FROM keyphrase WHERE key_index='covid');
++---------------------------+
+| COUNT(DISTINCT phr_keyid) |
++---------------------------+
+| 609603 |
++---------------------------+
+1 row in set (7,912 sec)
+
+#----------------------------------------------
+# Put the counts in key_count
+# I had to do this, to have the count at hand, and not have to count at the moment
+# This makes it easier to sort in descending counting order, particularly when searching between dates
+# NOTE: this is the count of how many co-occurrences there are of a given pair of emojis (between two dates, or without date limit, depends on each case)
+# NOTE2: I don't know if this particular script is prepared to work with dates - CONFIRM
+
+./mdbPutKeyphraseCountByIndex.py -i covid
+Total time 3428.41299533844 seconds
+
+#--------------------------------------------------
+# Pass Keyphrases from MariaDB to Neo4j
+
+./mdbPutNeoKeyphrase.py -i covid
+Total time 1270.0084846019745 seconds
+
+################################################ ####
+Place IDF fields in MariaDB's PHRASE table
+
+./mdbPutIDF.py -i covid
+Total time 30429.561678171158 seconds
+
+################################################ ####
+# Update the phr_tfidf field
+
+mysql
+\remojis
+UPDATE phrase SET phr_tfidf=phr_count*phr_idf WHERE phr_tfidf IS NULL;
+
+MariaDB [emojis]> UPDATE phrase SET phr_tfidf=phr_count*phr_idf WHERE phr_tfidf IS NULL;
+Query OK, 18444746 rows affected (2 min 14,860 sec)
+Rows matched: 18444746 Changed: 18444746 Warnings: 0
+
+#---------------------------------------------------------------- ---
+# Same for the phr_weightidf field
+
+mysql
+\remojis
+UPDATE phrase SET phr_weightidf=phr_weight*phr_idf WHERE phr_weightidf IS NULL;
+
+MariaDB [emojis]> UPDATE phrase SET phr_weightidf=phr_weight*phr_idf WHERE phr_weightidf IS NULL;
+Query OK, 18444746 rows affected (4 min 4,191 sec)
+Rows matched: 18444746 Changed: 18444746 Warnings: 0
+
+#--------------------------------------------------
+# Pass Keyphrases from MariaDB to Neo4j - but now, ordered by phr_weightidf DESC
+
+./mdbPutNeoIdfKeyphrase.py -i covid
+Total time 774.1195576190948 seconds
+
+################################################ ################################
+# Counts
+################################################ ################################
+
+################################################ ################################
+# Count the total number of co-occurrences in ElasticSearch
+
+cd /disco2/keyphrase
+./esCountEmojiCO.py -i covid -o text
+Total co-occurrences: 36245634
+Total time 2254.61101436615 seconds
+
+
+################################################ ################################
+# Count the total number of co-occurrences in Neo4j
+
+#---------------------------------
+# Total co-occurrences, excluding repetitions within the same tweet
+#---------------------------------
+MATCH (n)-[r:FOLLOWED_BY { index: "covid" }]->(m) RETURN COUNT(r)
+20812373
+
+#---------------------------------
+# Total co-occurrences, including repetitions within the same tweet
+#---------------------------------
+MATCH (n)-[r:FOLLOWED_BY { index: "covid" }]->(m) RETURN SUM(r.count)
+36245634
+
+#---------------------------------
+# Total co-occurrences, excluding repetitions. Only the number of co-occurrences, i.e., unique sequences of 2 emojis present in the dataset
+#---------------------------------
+MATCH (n)-[r:KEYPHRASES { index: "covid" }]->(m) RETURN COUNT(r);
+654124
+
+################################################ ################################
+# Count the total number of co-occurrences in MariaDB
+
+#---------------------------------
+# Total co-occurrences, excluding repetitions within the same tweet
+#---------------------------------
+
+MariaDB [emojis]> SELECT COUNT(*) FROM follow WHERE fol_index='covid';
++----------+
+| COUNT(*) |
++----------+
+| 20812373 |
++----------+
+1 row in set (5,483 sec)
+
+#---------------------------------
+# Total co-occurrences, including repetitions within the same tweet
+#---------------------------------
+
+MariaDB [emojis]> SELECT SUM(fol_count) FROM follow WHERE fol_index='covid';
++----------------+
+| SUM(fol_count) |
++----------------+
+| 36245634 |
++----------------+
+1 row in set (38,270 sec)
+
+#--------------------------
+# For keyphrase table
+
+MariaDB [emojis]> SELECT COUNT(*) FROM keyphrase WHERE key_index='covid';
++----------+
+| COUNT(*) |
++----------+
+| 654124 |
++----------+
+1 row in set (0.238 sec)
+
+
+MariaDB [emojis]> SELECT COUNT(*) FROM phrase WHERE phr_keyid IN (SELECT key_id FROM keyphrase WHERE key_index='covid');
++----------+
+| COUNT(*) |
++----------+
+| 18444746 |
++----------+
+1 row in set (4,291 sec)
+
+
+MATCH (n)-[r:KEYPHRASES { index: "covid" }]->(m) RETURN COUNT(r);
+654124
+
+################################################ ################################
+# emojis-co-occurrence-50-most-used (results are in a file with the name: emojis-co-occurrence-50-most-used.txt)
+
+#-----------------------------------------------
+# Indifferent
+MATCH (n)-[r:FOLLOWED_BY { index: "covid" }]->(m) RETURN n.emoji,n.name,m.emoji,m.name,SUM(r.count) ORDER BY SUM(r .count) DESC LIMIT 50;
+
+#-----------------------------------------------
+# With repetition
+MATCH (n)-[r:FOLLOWED_BY { index: "covid" }]->(m) WHERE n.emoji = m.emoji RETURN n.emoji,n.name,m.emoji,m.name,SUM(r .count) ORDER BY SUM(r.count) DESC LIMIT 50;
+
+#-----------------------------------------------
+# No repetition
+MATCH (n)-[r:FOLLOWED_BY { index: "covid" }]->(m) WHERE n.emoji <> m.emoji RETURN n.emoji,n.name,m.emoji,m.name,SUM( r.count) ORDER BY SUM(r.count) DESC LIMIT 50;
+
+#-----------------------------------------------
+# No repetition and independent of order
+MATCH (n)-[r:FOLLOWED_BY { index: "covid" }]-(m) WHERE n.emoji <> m.emoji AND ID(n) < ID(m) RETURN n.emoji,n.name,m .emoji,m.name,SUM(r.count) ORDER BY SUM(r.count) DESC LIMIT 50;
+
+
+################################################ ######################
+# Count number of tweets
+################################################ ######################
+
+#-------------------------------------------
+# Original tweets, (no retweets or quoted tweets)
+#-------------------------------------------
+curl -H "Content-Type: application/json" -XGET '127.0.0.1:9200/covid/_count?pretty' -d '
+{
+   "query": {
+     "bool": {
+       "must": [
+         {
+           "match": {
+             "original_field": "text"
+           }
+         }
+       ]
+     }
+   }
+}
+'
+{
+   "count" : 282599966,
+   "_shards" : {
+     "total" : 1,
+     "successful" : 1,
+     "skipped" : 0,
+     "failed" : 0
+   }
+}
+
+#-------------------------------------------
+# All Tweets (with retweets, and quoted tweets)
+#-------------------------------------------
+curl -H "Content-Type: application/json" -XGET '127.0.0.1:9200/covid/_count?pretty'
+{
+   "count" : 963167162,
+   "_shards" : {
+     "total" : 1,
+     "successful" : 1,
+     "skipped" : 0,
+     "failed" : 0
+   }
+}
+
+################################################ ######################
+# Count the total number of emojis
+################################################ ######################
+
+#-------------------------------------------
+# Total number of emojis in all tweets (including text, rtext and qtext)
+#-------------------------------------------
+curl -H "Content-Type: application/json" -XGET '127.0.0.1:9200/covid/_search?pretty' -d '
+{
+   "query": {"match_all": {}
+   }
+, "size": 0,
+"aggs" : {
+"sum": {
+"sum": {"field" : "n_emoji"}
+}
+}
+}
+'
+{
+   "took" : 27096,
+   "timed_out" : false,
+   "_shards" : {
+     "total" : 1,
+     "successful" : 1,
+     "skipped" : 0,
+     "failed" : 0
+   },
+   "hits" : {
+     "total" : {
+       "value" : 10000,
+       "relation" : "gte"
+     },
+     "max_score" : null,
+     "hits" : [ ]
+   },
+   "aggregations" : {
+     "sum" : {
+       "value" : 3.11277203E8
+     }
+   }
+}
+
+#-------------------------------------------
+# Total number of emojis in original tweets (text type only, excluding rtext and qtext)
+#-------------------------------------------
+curl -H "Content-Type: application/json" -XGET '127.0.0.1:9200/covid/_search?pretty' -d '
+{
+   "query": {
+     "bool": {
+       "must": [
+         {
+           "match": {
+             "original_field": "text"
+           }
+         }
+       ]
+     }
+   }, "size": 0,
+"aggs" : {
+"sum": {
+"sum": {"field" : "n_emoji"}
+}
+}
+}
+'
+{
+   "took" : 10247,
+   "timed_out" : false,
+   "_shards" : {
+     "total" : 1,
+     "successful" : 1,
+     "skipped" : 0,
+     "failed" : 0
+   },
+   "hits" : {
+     "total" : {
+       "value" : 10000,
+       "relation" : "gte"
+     },
+     "max_score" : null,
+     "hits" : [ ]
+   },
+   "aggregations" : {
+     "sum" : {
+       "value": 8.9114449E7
+     }
+   }
+}
+
+#-------------------------------------------
+# Confirmation in MariaDB
+#-------------------------------------------
+MariaDB [emojis]> SELECT SUM(emp_count) FROM emoji_project JOIN project ON emp_proid=pro_id WHERE pro_name='covid';
++----------------+
+| SUM(emp_count) |
++----------------+
+| 89114449 |
++----------------+
+1 row in set (0.016 sec)
+
+################################################ ######################
+# Maximum and minimum date of tweets
+################################################ ######################
+
+curl -X POST "localhost:9200/covid/_search?size=0&pretty" -H 'Content-Type: application/json' -d'
+{
+"aggs" : {
+        "min_date": {"min": {"field": "created_at"}},
+        "max_date": {"max": {"field": "created_at"}}
+     }
+}
+'
+{
+   "took" : 6101,
+   "timed_out" : false,
+   "_shards" : {
+     "total" : 1,
+     "successful" : 1,
+     "skipped" : 0,
+     "failed" : 0
+   },
+   "hits" : {
+     "total" : {
+       "value" : 10000,
+       "relation" : "gte"
+     },
+     "max_score" : null,
+     "hits" : [ ]
+   },
+   "aggregations" : {
+     "max_date" : {
+       "value" : 1.612137594E12,
+       "value_as_string" : "2021-01-31T23:59:54.000Z"
+     },
+     "min_date" : {
+       "value" : 1.579645119E12,
+       "value_as_string" : "2020-01-21T22:18:39.000Z"
+     }
+   }
+}
+
+
+################################################ ######################
+# Summary tables
+################################################ ######################
+
+#-------------------------------------------
+# Prominent emojis - closeness
+#-------------------------------------------
+http://localhost/distance.php?index=covid
+
+#-------------------------------------------
+# Top 50
+#-------------------------------------------
+http://localhost/top50.php?index=covid
+
+#-------------------------------------------
+# Top 50 IDF
+#-------------------------------------------
+http://localhost/top50idf.php?index=covid
+
+
+

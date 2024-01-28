@@ -1,0 +1,618 @@
+######################################################
+Complete pipeline with all the information
+######################################################
+# Pipeline for BREXIT:
+
+cd /disco2/keyphrase
+./unzip.py -d /disco2/BREXIT/tweets
+./proc_tweets.py -d /disco2/BREXIT/tweets
+./ngo.sh /disco2/BREXIT/tweets
+./creat_tw.py -d /disco2/BREXIT/tweets
+
+#############################################################
+# Restart ElasticSearch on Ubuntu
+
+service elasticsearch restart
+
+################################################################
+# Allow an ElasticSearch scroll to live for 30 days. The default is 1 day (24h)
+# https://www.elastic.co/guide/en/elasticsearch/reference/current/cluster-update-settings.html
+#
+# As I make a query to get all the records, this may cause a timeout.
+# To do this, you need to use the scroll and timeout parameters in the "elasticsearch.helpers.scan" function
+# https://www.elastic.co/guide/en/elasticsearch/reference/current/paginate-search-results.html#scroll-search-context
+# https://www.elastic.co/guide/en/elasticsearch/reference/current/common-options.html#time-units
+# https://github.com/elastic/elasticsearch-dsl-py/issues/796
+# https://stackoverflow.com/questions/33301119/error-with-elasticsearch-helpers-scan-api-when-using-query-parameter
+
+curl -X PUT "localhost:9200/_cluster/settings" -H 'Content-Type: application/json' -d'
+{
+  "persistent" : {
+    "search.max_keep_alive" : "30d"
+  }
+}
+'
+################################################################
+### Delete previous records, if necessary
+### curl -H "Content-Type: application/json" -XDELETE 127.0.0.1:9200/brexit
+
+# Create the mapping
+# Create a field in elasticsearch for searches by 24 different processors, to allow multiprocessing when loading neo4j
+# Create a field in elasticsearch to process data for different days, from 1 to 31
+# Create a field in elasticsearch to store the sum of emojis in the emojis array
+
+curl -H "Content-Type: application/json" -XPUT 127.0.0.1:9200/brexit -d '
+{
+	"mappings": {
+		"properties": {
+			"id_str": {"type": "long"}, 
+			"created_at": {"type": "date"}, 
+			"text": {"type": "text"}, 
+			"emoji": {
+				"type": "text", 
+				"fields": { "keyword": { "type": "keyword" } }
+			},
+			"id24": {"type": "long"},
+			"id31": {"type": "long"},
+			"n_emoji": {"type": "long"}
+		 }
+	}
+}
+'
+
+# Confirm the mapping
+curl -H "Content-Type: application/json" -XGET '127.0.0.1:9200/brexit/_mapping?pretty'
+
+mkdir /disco5/BREXIT
+mkdir /disco5/BREXIT/tweets
+cp -r /disco2/BREXIT/tweets/bre_01 /disco5/BREXIT/tweets
+cp -r /disco2/BREXIT/tweets/bre_02 /disco5/BREXIT/tweets
+cp -r /disco2/BREXIT/tweets/bre_03 /disco5/BREXIT/tweets
+cp -r /disco2/BREXIT/tweets/bre_04 /disco5/BREXIT/tweets
+cp -r /disco2/BREXIT/tweets/bre_05 /disco5/BREXIT/tweets
+cd /disco2/keyphrase
+./read2ES.py -i brexit -d /disco5/BREXIT/tweets/bre_01
+./read2ES.py -i brexit -d /disco5/BREXIT/tweets/bre_02
+./read2ES.py -i brexit -d /disco5/BREXIT/tweets/bre_03
+./read2ES.py -i brexit -d /disco5/BREXIT/tweets/bre_04
+./read2ES.py -i brexit -d /disco5/BREXIT/tweets/bre_05
+
+
+# Confirm insertion
+curl -H "Content-Type: application/json" -XGET '127.0.0.1:9200/brexit/_count?pretty'
+{
+  "count" : 10036024,
+  "_shards" : {
+    "total" : 1,
+    "successful" : 1,
+    "skipped" : 0,
+    "failed" : 0
+  }
+}
+
+
+rm -r /disco5/BREXIT/
+
+################################################################
+# Create 31 groups - one for each day of the month - within the CLIMATE index, to then process each day separately
+# Create 24 groups - one for each hour of the day - within the CLIMATE index, and then assign them to 24 processors
+# It took 1576812 millis to update, there are 10036024 entries in elasticsearch
+curl -X POST "localhost:9200/brexit/_update_by_query?pretty" -H 'Content-Type: application/json' -d'
+{
+"query": {"match_all": {}
+         },
+"script": "ctx._source.id31 = Integer.parseInt(ctx._source.created_at.substring(8,10)); ctx._source.id24 = Integer.parseInt(ctx._source.created_at.substring(11,13))"
+}
+'
+######################################################
+# Fill in the n_emoji field with the sum of the emojis in the document
+# It took 1631757 milliseconds
+curl -X POST "localhost:9200/brexit/_update_by_query?pretty" -H 'Content-Type: application/json' -d'
+{
+"query": {"match_all": {}
+          },
+"script": "ctx._source.n_emoji = ctx._source.emoji.length"
+}
+'
+################################################ ####
+# I have to increase the number of possible ES answers. I may have to do this several times until the command below stops giving an error.
+curl -X PUT "localhost:9200/_settings" -H 'Content-Type: application/json' -d'
+{
+   "index.max_result_window": 2000000000
+}
+'
+
+################################################ ####
+# Confirm the number of text type tweets, as well as the total number of emojis:
+./esCountEmojis.py -i brexit
+Total tweets of text type: 3488775
+Total emojis: 423856 ---- WRONG. THE CORRECT VALUE IS ----> 437652
+Total time 549.6210660934448 seconds
+
+################################################ ####
+# Launch neo4j:
+
+/usr/local/neo4j/bin/neo4j console
+
+# Add all emojis, and add the "n.brexit" property to each emoji, with the number of occurrences of that emoji
+cd /disco2/keyphrase
+./esPutNeo4jEmoji.py -i brexit
+Total time 1817.3051779270172 seconds
+
+################################################ ##############
+# Confirm, in Neo4j
+MATCH (n) RETURN SUM(n.brexit)
+437652
+
+################################################ ##############
+# Do the same for MariaDB
+
+./esPutMariaDBEmoji.py -i brexit
+Total time 1539.387330532074 seconds
+
+################################################ ##############
+# Confirm, in MariaDB
+MariaDB [emojis]> SELECT SUM(emp_count) FROM emoji_project JOIN project ON pro_id=emp_proid AND pro_name='brexit';
++----------------+
+| SUM(emp_count) |
++----------------+
+| 437652 |
++----------------+
+1 row in set (0.005 sec)
+
+
+################################################ ####
+# Pass co-occurrences to MariaDB
+# For BREXIT, all days can be passed at once, as there is little data
+
+./esPutMariaDB_ALL_DAYS.py -i brexit
+
+# After loading all the data into the FOLLOW table, run the following SQL:
+UPDATE follow SET fol_hour=HOUR(fol_created_at) WHERE fol_hour IS NULL;
+UPDATE follow SET fol_day=DAY(fol_created_at) WHERE fol_day IS NULL;
+
+################################################ ####
+# Pass co-occurrences to neo4j
+
+./mdbPutNeoFollow.py -i brexit
+Total time 47.54990863800049 seconds
+
+# Confirm that everything is ok in neo4j
+MATCH (n)-[r:FOLLOWED_BY { index: "brexit" }]->(m) RETURN COUNT(r)
+102436
+
+######################################################
+# To add keyphrases to neo4j, in summary form for each co-occurrence
+#-------------------------------------
+# With MariaDB it seems to be faster
+cd /disco2/keyphrase
+./esPutMariaDBKeyphrase.py -i brexit
+Total time 118.67935299873352 seconds
+
+#----------------------------------------------
+# Put the counts in key_count
+# I had to do this, to have the count at hand, and not have to count at the moment
+# This makes it easier to sort in descending counting order, particularly when searching between dates
+# NOTE: this is the count of how many co-occurrences there are of a given pair of emojis (between two dates, or without date limit, depends on each case)
+# NOTE2: I don't know if this particular script is prepared to work with dates - CONFIRM
+
+./mdbPutKeyphraseCountByIndex.py -i brexit
+Total time 57.47217011451721 seconds
+
+#--------------------------------------------------
+# Pass Keyphrases from MariaDB to Neo4j
+
+./mdbPutNeoKeyphrase.py -i brexit
+Total time 9.991360664367676 seconds
+
+################################################ ####
+Place IDF fields in MariaDB's PHRASE table
+
+./mdbPutIDF.py -i brexit
+Total time 213.4588921070099 seconds
+
+################################################ ####
+# Update the phr_tfidf field
+
+mysql
+\remojis
+UPDATE phrase SET phr_tfidf=phr_count*phr_idf WHERE phr_tfidf IS NULL;
+
+MariaDB [emojis]> UPDATE phrase SET phr_tfidf=phr_count*phr_idf WHERE phr_tfidf IS NULL;
+Query OK, 239053 rows affected (1,842 sec)
+Rows matched: 239053 Changed: 239053 Warnings: 0
+
+#---------------------------------------------------------------- ---
+# Same for the phr_weightidf field
+
+mysql
+\remojis
+UPDATE phrase SET phr_weightidf=phr_weight*phr_idf WHERE phr_weightidf IS NULL;
+
+MariaDB [emojis]> UPDATE phrase SET phr_weightidf=phr_weight*phr_idf WHERE phr_weightidf IS NULL;
+Query OK, 239053 rows affected (1,879 sec)
+Rows matched: 239053 Changed: 239053 Warnings: 0
+
+#--------------------------------------------------
+# Pass Keyphrases from MariaDB to Neo4j - but now, ordered by phr_weightidf DESC
+
+./mdbPutNeoIdfKeyphrase.py -i brexit
+Total time 9.831202030181885 seconds
+
+################################################ ################################
+# By date ranges
+################################################ ################################
+
+# To add keyphrases to neo4j, in summary form for each co-occurrence, but with date ranges
+
+./esPutMariaDBKeyphraseDate.py -i brexit -s 2016-06-17 -e 2016-06-24
+Total time 24.428669214248657 seconds
+
+./esPutMariaDBKeyphraseDate.py -i brexit -s 2016-06-24 -e 2016-07-01
+Total time 45.69211506843567 seconds
+
+# Put the counts in key_count (now with dates)
+
+./mdbPutKeyphraseCountByIndexByDate.py -i brexit
+Total time 80.27234721183777 seconds
+
+#--------------------------------------------------
+# Pass Keyphrases from MariaDB to Neo4j - IDEM, BY DATES
+
+./mdbPutNeoDateKeyphrase.py -i brexit -s 2016-06-17 -e 2016-06-24
+Total time 9.081056833267212 seconds
+
+./mdbPutNeoDateKeyphrase.py -i brexit -s 2016-06-24 -e 2016-07-01
+Total time 6.315638303756714 seconds
+
+#--------------------------------------------------
+# Place the IDF fields in MariaDB's PHRASE table, but now with date ranges -->>
+# ATTENTION, HERE IS A COMPLETE DATE BLOCK (includes BEFORE AND AFTER)
+
+./mdbPutIDFByDate.py -i brexit -s 2016-06-17 -e 2016-07-01
+Total time 413.80802726745605 seconds
+
+#------------------------------------
+# Update the phr_tfidf field, created in the meantime
+
+mysql
+\remojis
+UPDATE phrase SET phr_tfidf=phr_count*phr_idf WHERE phr_tfidf IS NULL;
+
+MariaDB [emojis]> UPDATE phrase SET phr_tfidf=phr_count*phr_idf WHERE phr_tfidf IS NULL;
+Query OK, 90372 rows affected (14,625 sec)
+Rows matched: 90372 Changed: 90372 Warnings: 0
+
+#---------------------------------------------------------------- ---
+# Same for the phr_weightidf field, created in the meantime
+
+mysql
+\remojis
+UPDATE phrase SET phr_weightidf=phr_weight*phr_idf WHERE phr_weightidf IS NULL;
+
+MariaDB [emojis]> UPDATE phrase SET phr_weightidf=phr_weight*phr_idf WHERE phr_weightidf IS NULL;
+Query OK, 90372 rows affected (14,460 sec)
+Rows matched: 90372 Changed: 90372 Warnings: 0
+
+#--------------------------------------------------
+# Pass Keyphrases from MariaDB to Neo4j - IDEM, BY DATES - but now, ordered by phr_weightidf DESC
+
+./mdbPutNeoDateIdfKeyphrase.py -i brexit -s 2016-06-17 -e 2016-06-24
+Total time 2.6704354286193848 seconds
+
+./mdbPutNeoDateIdfKeyphrase.py -i brexit -s 2016-06-24 -e 2016-07-01
+Total time 5.3012611865997314 seconds
+
+
+################################################ ################################
+# Counts
+################################################ ################################
+
+################################################ ################################
+# Count the total number of co-occurrences in ElasticSearch
+
+cd /disco2/keyphrase
+./esCountEmojiCO.py -i brexit -o text
+Total co-occurrences: 160616
+Total time 11.992413520812988 seconds
+
+################################################ ################################
+# Count the total number of co-occurrences in Neo4j
+
+#---------------------------------
+# Total co-occurrences, excluding repetitions within the same tweet
+#---------------------------------
+MATCH (n)-[r:FOLLOWED_BY { index: "brexit" }]->(m) RETURN COUNT(r)
+102436
+
+#---------------------------------
+# Total co-occurrences, including repetitions within the same tweet
+#---------------------------------
+MATCH (n)-[r:FOLLOWED_BY { index: "brexit" }]->(m) RETURN SUM(r.count)
+160616
+
+#---------------------------------
+# Total co-occurrences, excluding repetitions. Only the number of co-occurrences, i.e., unique sequences of 2 emojis present in the dataset
+#---------------------------------
+MATCH (n)-[r:KEYPHRASES { index: "brexit" }]->(m) RETURN COUNT(r);
+22733
+
+################################################ ################################
+# Count the total number of co-occurrences in MariaDB
+
+#---------------------------------
+# Total co-occurrences, excluding repetitions within the same tweet
+#---------------------------------
+
+MariaDB [emojis]> SELECT COUNT(*) FROM follow WHERE fol_index='brexit';
++----------+
+| COUNT(*) |
++----------+
+| 102436 |
++----------+
+1 row in set (0.041 sec)
+
+#---------------------------------
+# Total co-occurrences, including repetitions within the same tweet
+#---------------------------------
+
+MariaDB [emojis]> SELECT SUM(fol_count) FROM follow WHERE fol_index='brexit';
++----------------+
+| SUM(fol_count) |
++----------------+
+| 160616 |
++----------------+
+1 row in set (0.107 sec)
+
+#--------------------------
+# For keyphrase table
+
+
+MariaDB [emojis]> SELECT COUNT(*) FROM keyphrase WHERE key_index='brexit';
++----------+
+| COUNT(*) |
++----------+
+| 22733 |
++----------+
+1 row in set (0.018 sec)
+
+
+MariaDB [emojis]> SELECT COUNT(*) FROM phrase WHERE phr_keyid IN (SELECT key_id FROM keyphrase WHERE key_index='brexit');
++----------+
+| COUNT(*) |
++----------+
+| 239053 |
++----------+
+1 row in set (0.086 sec)
+
+
+MATCH (n)-[r:KEYPHRASES { index: "brexit" }]->(m) RETURN COUNT(r);
+22733
+
+####################################################################################
+# emojis-co-occurrence-50-most-used (results are in a file with the name: emojis-co-occurrence-50-most-used.txt)
+
+#-----------------------------------------------
+# Indifferent
+MATCH (n)-[r:FOLLOWED_BY { index: "brexit" }]->(m) RETURN n.emoji,n.name,m.emoji,m.name,SUM(r.count) ORDER BY SUM(r .count) DESC LIMIT 50;
+
+#-----------------------------------------------
+# With repetition
+MATCH (n)-[r:FOLLOWED_BY { index: "brexit" }]->(m) WHERE n.emoji = m.emoji RETURN n.emoji,n.name,m.emoji,m.name,SUM(r .count) ORDER BY SUM(r.count) DESC LIMIT 50;
+
+#-----------------------------------------------
+# No repetition
+MATCH (n)-[r:FOLLOWED_BY { index: "brexit" }]->(m) WHERE n.emoji <> m.emoji RETURN n.emoji,n.name,m.emoji,m.name,SUM( r.count) ORDER BY SUM(r.count) DESC LIMIT 50;
+
+#-----------------------------------------------
+# No repetition and independent of order
+MATCH (n)-[r:FOLLOWED_BY { index: "brexit" }]-(m) WHERE n.emoji <> m.emoji AND ID(n) < ID(m) RETURN n.emoji,n.name,m .emoji,m.name,SUM(r.count) ORDER BY SUM(r.count) DESC LIMIT 50;
+
+
+################################################ ######################
+# Count number of tweets
+################################################ ######################
+
+#-------------------------------------------
+# Original tweets, (no retweets or quoted tweets)
+#-------------------------------------------
+curl -H "Content-Type: application/json" -XGET '127.0.0.1:9200/brexit/_count?pretty' -d '
+{
+   "query": {
+     "bool": {
+       "must": [
+         {
+           "match": {
+             "original_field": "text"
+           }
+         }
+       ]
+     }
+   }
+}
+'
+{
+   "count" : 3488775,
+   "_shards" : {
+     "total" : 1,
+     "successful" : 1,
+     "skipped" : 0,
+     "failed" : 0
+   }
+}
+
+#-------------------------------------------
+# All Tweets (comm retweets, and quoted tweets)
+#-------------------------------------------
+curl -H "Content-Type: application/json" -XGET '127.0.0.1:9200/brexit/_count?pretty'
+{
+   "count" : 10036024,
+   "_shards" : {
+     "total" : 1,
+     "successful" : 1,
+     "skipped" : 0,
+     "failed" : 0
+   }
+}
+
+################################################ ######################
+# Count the total number of emojis
+################################################ ######################
+
+#-------------------------------------------
+# Total number of emojis in all tweets (including text, rtext and qtext)
+#-------------------------------------------
+curl -H "Content-Type: application/json" -XGET '127.0.0.1:9200/brexit/_search?pretty' -d '
+{
+   "query": {"match_all": {}
+   }
+, "size": 0,
+"aggs" : {
+"sum": {
+"sum": {"field" : "n_emoji"}
+}
+}
+}
+'
+{
+   "took" : 457,
+   "timed_out" : false,
+   "_shards" : {
+     "total" : 1,
+     "successful" : 1,
+     "skipped" : 0,
+     "failed" : 0
+   },
+   "hits" : {
+     "total" : {
+       "value" : 10000,
+       "relation" : "gte"
+     },
+     "max_score" : null,
+     "hits" : [ ]
+   },
+   "aggregations" : {
+     "sum" : {
+       "value" : 1566344.0
+     }
+   }
+}
+
+#-------------------------------------------
+# Total number of emojis in original tweets (text type only, excluding rtext and qtext)
+#-------------------------------------------
+curl -H "Content-Type: application/json" -XGET '127.0.0.1:9200/brexit/_search?pretty' -d '
+{
+   "query": {
+     "bool": {
+       "must": [
+         {
+           "match": {
+             "original_field": "text"
+           }
+         }
+       ]
+     }
+   }, "size": 0,
+"aggs" : {
+"sum": {
+"sum": {"field" : "n_emoji"}
+}
+}
+}
+'
+{
+   "took" : 171,
+   "timed_out" : false,
+   "_shards" : {
+     "total" : 1,
+     "successful" : 1,
+     "skipped" : 0,
+     "failed" : 0
+   },
+   "hits" : {
+     "total" : {
+       "value" : 10000,
+       "relation" : "gte"
+     },
+     "max_score" : null,
+     "hits" : [ ]
+   },
+   "aggregations" : {
+     "sum" : {
+       "value" : 437652.0
+     }
+   }
+}
+
+#-------------------------------------------
+# Confirmation in MariaDB
+#-------------------------------------------
+MariaDB [emojis]> SELECT SUM(emp_count) FROM emoji_project JOIN project ON emp_proid=pro_id WHERE pro_name='brexit';
++----------------+
+| SUM(emp_count) |
++----------------+
+| 437652 |
++----------------+
+1 row in set (0.006 sec)
+
+################################################ ######################
+# Maximum and minimum date of tweets
+################################################ ######################
+
+curl -X POST "localhost:9200/brexit/_search?size=0&pretty" -H 'Content-Type: application/json' -d'
+{
+"aggs" : {
+        "min_date": {"min": {"field": "created_at"}},
+        "max_date": {"max": {"field": "created_at"}}
+     }
+}
+'
+{
+   "took" : 131,
+   "timed_out" : false,
+   "_shards" : {
+     "total" : 1,
+     "successful" : 1,
+     "skipped" : 0,
+     "failed" : 0
+   },
+   "hits" : {
+     "total" : {
+       "value" : 10000,
+       "relation" : "gte"
+     },
+     "max_score" : null,
+     "hits" : [ ]
+   },
+   "aggregations" : {
+     "max_date" : {
+       "value" : 1.60993115E12,
+       "value_as_string" : "2021-01-06T11:05:50.000Z"
+     },
+     "min_date" : {
+       "value" : 1.463065114E12,
+       "value_as_string" : "2016-05-12T14:58:34.000Z"
+     }
+   }
+}
+
+
+################################################ ######################
+# Summary tables
+################################################ ######################
+
+#-------------------------------------------
+# Prominent emojis - closeness
+#-------------------------------------------
+http://localhost/distance.php?index=brexit
+
+#-------------------------------------------
+# Top 50
+#-------------------------------------------
+http://localhost/top50.php?index=brexit
+
+#-------------------------------------------
+# Top 50 IDF
+#-------------------------------------------
+http://localhost/top50idf.php?index=brexit

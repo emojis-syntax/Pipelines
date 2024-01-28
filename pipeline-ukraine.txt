@@ -1,0 +1,516 @@
+######################################################
+Complete pipeline with all the information
+######################################################
+# Pipeline for UKRAINE:
+
+cd /disco2/keyphrase
+# ./unzip.py -d /disco2/UKRAINE/tweets
+./lproc_tweets.py -d /disco2/UKRAINE/tweets
+./ngo.sh /disco2/UKRAINE/tweets
+./creat_tw.py -d /disco2/UKRAINE/tweets
+
+#############################################################
+# Restart ElasticSearch on Ubuntu
+
+service elasticsearch restart
+
+################################################################
+# Allow an ElasticSearch scroll to live for 30 days. The default is 1 day (24h)
+# https://www.elastic.co/guide/en/elasticsearch/reference/current/cluster-update-settings.html
+#
+# As I make a query to get all the records, this may cause a timeout.
+# To do this, you need to use the scroll and timeout parameters in the "elasticsearch.helpers.scan" function
+# https://www.elastic.co/guide/en/elasticsearch/reference/current/paginate-search-results.html#scroll-search-context
+# https://www.elastic.co/guide/en/elasticsearch/reference/current/common-options.html#time-units
+# https://github.com/elastic/elasticsearch-dsl-py/issues/796
+# https://stackoverflow.com/questions/33301119/error-with-elasticsearch-helpers-scan-api-when-using-query-parameter
+
+curl -X PUT "localhost:9200/_cluster/settings" -H 'Content-Type: application/json' -d'
+{
+  "persistent" : {
+    "search.max_keep_alive" : "30d"
+  }
+}
+'
+################################################################
+### Delete previous records, if necessary
+### curl -H "Content-Type: application/json" -XDELETE 127.0.0.1:9200/ukraine
+
+# Create the mapping
+# Create a field in elasticsearch for searches by 24 different processors, to allow multiprocessing when loading neo4j
+# Create a field in elasticsearch to process data for different days, from 1 to 31
+# Create a field in elasticsearch to store the sum of emojis in the emojis array
+
+curl -H "Content-Type: application/json" -XPUT 127.0.0.1:9200/ukraine -d '
+{
+	"mappings": {
+		"properties": {
+			"id_str": {"type": "long"}, 
+			"created_at": {"type": "date"}, 
+			"text": {"type": "text"}, 
+			"emoji": {
+				"type": "text", 
+				"fields": { "keyword": { "type": "keyword" } }
+			},
+			"id24": {"type": "long"},
+			"id31": {"type": "long"},
+			"n_emoji": {"type": "long"}
+		 }
+	}
+}
+'
+
+# Confirm the mapping
+curl -H "Content-Type: application/json" -XGET '127.0.0.1:9200/ukraine/_mapping?pretty'
+
+mkdir /disco5/ukraine/
+mkdir /disco5/ukraine/tweets/
+rsync -zarv  --prune-empty-dirs --include "*/"  --include="*.tw" --exclude="*" "/disco2/UKRAINE/tweets/" "/disco5/ukraine/tweets/"
+
+./read2ES.py -i ukraine -d /disco5/ukraine/tweets
+
+# Confirm insertion
+curl -H "Content-Type: application/json" -XGET '127.0.0.1:9200/ukraine/_count?pretty'
+{
+  "count" : 12903816,
+  "_shards" : {
+    "total" : 1,
+    "successful" : 1,
+    "skipped" : 0,
+    "failed" : 0
+  }
+}
+
+rm -r /disco5/ukraine/
+
+######################################################
+# The following two commands are no longer used.
+# Now use a command that does both.
+# See: COVID or US2020
+
+################################################################
+# Create 31 groups - one for each day of the month - within the CLIMATE index, to then process each day separately
+# Create 24 groups - one for each hour of the day - within the CLIMATE index, and then assign them to 24 processors
+# It took 2354964 millis to update, there are 12903816 entries in elasticsearch
+curl -X POST "localhost:9200/ukraine/_update_by_query?pretty" -H 'Content-Type: application/json' -d'
+{
+"query": {"match_all": {}
+         },
+"script": "ctx._source.id31 = Integer.parseInt(ctx._source.created_at.substring(8,10)); ctx._source.id24 = Integer.parseInt(ctx._source.created_at.substring(11,13))"
+}
+'
+
+######################################################
+# Fill in the n_emoji field with the sum of the emojis in the document
+# It took 2318727 milliseconds
+curl -X POST "localhost:9200/ukraine/_update_by_query?pretty" -H 'Content-Type: application/json' -d'
+{
+"query": {"match_all": {}
+          },
+"script": "ctx._source.n_emoji = ctx._source.emoji.length"
+}
+'
+################################################ ####
+# I have to increase the number of possible ES answers. I may have to do this several times until the command below stops giving an error.
+curl -X PUT "localhost:9200/_settings" -H 'Content-Type: application/json' -d'
+{
+   "index.max_result_window": 2000000000
+}
+'
+
+################################################ ####
+# Launch neo4j:
+
+/usr/local/neo4j/bin/neo4j console
+
+# Add all emojis, and add the "n.ukraine" property to each emoji, with the number of occurrences of that emoji
+cd /disco2/keyphrase
+./esPutNeo4jEmoji.py -i ukraine
+Total text type tweets: 2549798
+Partial time 343.14585041999817 seconds
+Total emojis: 1097124
+Total time 3838.535988807678 seconds
+
+################################################ ##############
+# Confirm, in Neo4j
+MATCH (n) RETURN SUM(n.ukraine)
+1097124
+
+################################################ ##############
+# Do the same for MariaDB
+
+./esPutMariaDBEmoji.py -i ukraine
+Total time 4226.477134227753 seconds
+
+################################################ ##############
+# Confirm, in MariaDB
+MariaDB [emojis]> SELECT SUM(emp_count) FROM emoji_project JOIN project ON pro_id=emp_proid AND pro_name='ukraine';
++----------------+
+| SUM(emp_count) |
++----------------+
+| 1097124 |
++----------------+
+1 row in set (0.005 sec)
+
+################################################ ####
+# Pass co-occurrences to MariaDB
+# For UKRAINE, all days can be passed at once, as there is little data
+
+./esPutMariaDB_ALL_DAYS.py -i ukraine
+
+# After loading all the data into the FOLLOW table, run the following SQL:
+UPDATE follow SET fol_hour=HOUR(fol_created_at) WHERE fol_hour IS NULL;
+UPDATE follow SET fol_day=DAY(fol_created_at) WHERE fol_day IS NULL;
+
+MariaDB [emojis]> UPDATE follow SET fol_hour=HOUR(fol_created_at) WHERE fol_hour IS NULL;
+Query OK, 266262 rows affected (5,083 sec)
+Rows matched: 266262 Changed: 266262 Warnings: 0
+
+MariaDB [emojis]> UPDATE follow SET fol_day=DAY(fol_created_at) WHERE fol_day IS NULL;
+Query OK, 266262 rows affected (4,747 sec)
+Rows matched: 266262 Changed: 266262 Warnings: 0
+
+################################################ ####
+# Pass co-occurrences to neo4j
+
+./mdbPutNeoFollow.py -i ukraine
+Total time 156.17346954345703 seconds
+
+# Confirm that everything is ok in neo4j
+MATCH (n)-[r:FOLLOWED_BY { index: "ukraine" }]->(m) RETURN COUNT(r)
+266262
+
+################################################ ####
+# To add keyphrases to neo4j, in summary form for each co-occurrence
+#-------------------------------------
+# With MariaDB it seems to be faster
+cd /disco2/keyphrase
+./esPutMariaDBKeyphrase.py -i ukraine
+Total time 263.59192967414856 seconds
+
+#----------------------------------------------
+# Put the counts in key_count
+# I had to do this, to have the count at hand, and not have to count at the moment
+# This makes it easier to sort in descending counting order, particularly when searching between dates
+# NOTE: this is the count of how many co-occurrences there are of a given pair of emojis (between two dates, or without date limit, depends on each case)
+# NOTE2: I don't know if this particular script is prepared to work with dates - CONFIRM
+
+./mdbPutKeyphraseCountByIndex.py -i ukraine
+Total time 167.55856704711914 seconds
+
+#------------------------------------
+# Pass Keyphrases from MariaDB to Neo4j
+
+./mdbPutNeoKeyphrase.py -i ukraine
+Total time 17.162055253982544 seconds
+
+################################################ ####
+Place IDF fields in MariaDB's PHRASE table
+
+./mdbPutIDF.py -i ukraine
+Total time 1187.089943408966 seconds
+
+################################################ ####
+# Update the phr_tfidf field
+
+mysql
+\remojis
+UPDATE phrase SET phr_tfidf=phr_count*phr_idf WHERE phr_tfidf IS NULL;
+
+MariaDB [emojis]> UPDATE phrase SET phr_tfidf=phr_count*phr_idf WHERE phr_tfidf IS NULL;
+Query OK, 471394 rows affected (17,947 sec)
+Rows matched: 471394 Changed: 471394 Warnings: 0
+
+#---------------------------------------------------------------- ---
+# Same for the phr_weightidf field
+
+mysql
+\remojis
+UPDATE phrase SET phr_weightidf=phr_weight*phr_idf WHERE phr_weightidf IS NULL;
+
+MariaDB [emojis]> UPDATE phrase SET phr_weightidf=phr_weight*phr_idf WHERE phr_weightidf IS NULL;
+Query OK, 471394 rows affected (17,737 sec)
+Rows matched: 471394 Changed: 471394 Warnings: 0
+
+#--------------------------------------------------
+# Pass Keyphrases from MariaDB to Neo4j - but now, ordered by phr_weightidf DESC
+
+./mdbPutNeoIdfKeyphrase.py -i ukraine
+Total time 17.09582233428955 seconds
+
+################################################ ################################
+# Counts
+################################################ ################################
+
+################################################ ################################
+# Count the total number of co-occurrences in ElasticSearch
+
+cd /disco2/keyphrase
+./esCountEmojiCO.py -i ukraine -o text
+Total time 27.50384283065796 seconds
+
+################################################ ################################
+# Count the total number of co-occurrences in Neo4j
+
+#---------------------------------
+# Total co-occurrences, excluding repetitions within the same tweet
+#---------------------------------
+MATCH (n)-[r:FOLLOWED_BY { index: "ukraine" }]->(m) RETURN COUNT(r)
+266262
+
+#---------------------------------
+# Total co-occurrences, including repetitions within the same tweet
+#---------------------------------
+MATCH (n)-[r:FOLLOWED_BY { index: "ukraine" }]->(m) RETURN SUM(r.count)
+406305
+
+#---------------------------------
+# Total co-occurrences, excluding repetitions. Only the number of co-occurrences, i.e., unique sequences of 2 emojis present in the dataset
+#---------------------------------
+MATCH (n)-[r:KEYPHRASES { index: "ukraine" }]->(m) RETURN COUNT(r);
+30904
+
+################################################ ################################
+# Count the total number of co-occurrences in MariaDB
+
+#---------------------------------
+# Total co-occurrences, excluding repetitions within the same tweet
+#---------------------------------
+
+MariaDB [emojis]> SELECT COUNT(*) FROM follow WHERE fol_index='ukraine';
++----------+
+| COUNT(*) |
++----------+
+| 266262 |
++----------+
+1 row in set (0.090 sec)
+
+#---------------------------------
+# Total co-occurrences, including repetitions within the same tweet
+#---------------------------------
+
+MariaDB [emojis]> SELECT SUM(fol_count) FROM follow WHERE fol_index='ukraine';
++----------------+
+| SUM(fol_count) |
++----------------+
+| 406305 |
++----------------+
+1 row in set (0.282 sec)
+
+#--------------------------
+# For keyphrase table
+
+
+MariaDB [emojis]> SELECT COUNT(*) FROM keyphrase WHERE key_index='ukraine';
++----------+
+| COUNT(*) |
++----------+
+| 30904 |
++----------+
+1 row in set (0.020 sec)
+
+
+MariaDB [emojis]> SELECT COUNT(*) FROM phrase WHERE phr_keyid IN (SELECT key_id FROM keyphrase WHERE key_index='metoo');
++----------+
+| COUNT(*) |
++----------+
+| 6303 |
++----------+
+1 row in set (0.009 sec)
+
+
+
+MATCH (n)-[r:KEYPHRASES { index: "ukraine" }]->(m) RETURN COUNT(r);
+30904
+
+
+################################################ ################################
+# emojis-co-occurrence-50-most-used (results are in a file with the name: emojis-co-occurrence-50-most-used.txt)
+
+#-----------------------------------------------
+# Indifferent
+MATCH (n)-[r:FOLLOWED_BY { index: "ukraine" }]->(m) RETURN n.emoji,n.name,m.emoji,m.name,SUM(r.count) ORDER BY SUM(r .count) DESC LIMIT 50;
+
+#-----------------------------------------------
+# With repetition
+MATCH (n)-[r:FOLLOWED_BY { index: "ukraine" }]->(m) WHERE n.emoji = m.emoji RETURN n.emoji,n.name,m.emoji,m.name,SUM(r .count) ORDER BY SUM(r.count) DESC LIMIT 50;
+
+#-----------------------------------------------
+# No repetition
+MATCH (n)-[r:FOLLOWED_BY { index: "ukraine" }]->(m) WHERE n.emoji <> m.emoji RETURN n.emoji,n.name,m.emoji,m.name,SUM( r.count) ORDER BY SUM(r.count) DESC LIMIT 50;
+
+#-----------------------------------------------
+# No repetition and independent of order
+MATCH (n)-[r:FOLLOWED_BY { index: "ukraine" }]-(m) WHERE n.emoji <> m.emoji AND ID(n) < ID(m) RETURN n.emoji,n.name,m .emoji,m.name,SUM(r.count) ORDER BY SUM(r.count) DESC LIMIT 50;
+
+
+################################################ ######################
+# Count number of tweets
+################################################ ######################
+
+#-------------------------------------------
+# Original tweets, (no retweets or quoted tweets)
+#-------------------------------------------
+curl -H "Content-Type: application/json" -XGET '127.0.0.1:9200/ukraine/_count?pretty' -d '
+{
+   "query": {
+     "bool": {
+       "must": [
+         {
+           "match": {
+             "original_field": "text"
+           }
+         }
+       ]
+     }
+   }
+}
+'
+{
+   "count" : 2549798,
+   "_shards" : {
+     "total" : 1,
+     "successful" : 1,
+     "skipped" : 0,
+     "failed" : 0
+   }
+}
+
+#-------------------------------------------
+# All Tweets (comm retweets, and quoted tweets)
+#-------------------------------------------
+curl -H "Content-Type: application/json" -XGET '127.0.0.1:9200/ukraine/_count?pretty'
+{
+   "count" : 12903816,
+   "_shards" : {
+     "total" : 1,
+     "successful" : 1,
+     "skipped" : 0,
+     "failed" : 0
+   }
+}
+
+################################################ ######################
+# Count the total number of emojis
+################################################ ######################
+
+#-------------------------------------------
+# Total number of emojis in all tweets (including text, rtext and qtext)
+#-------------------------------------------
+curl -H "Content-Type: application/json" -XGET '127.0.0.1:9200/ukraine/_search?pretty' -d '
+{
+   "query": {"match_all": {}
+   }
+, "size": 0,
+"aggs" : {
+"sum": {
+"sum": {"field" : "n_emoji"}
+}
+}
+}
+'
+{
+   "took" : 493,
+   "timed_out" : false,
+   "_shards" : {
+     "total" : 1,
+     "successful" : 1,
+     "skipped" : 0,
+     "failed" : 0
+   },
+   "hits" : {
+     "total" : {
+       "value" : 10000,
+       "relation" : "gte"
+     },
+     "max_score" : null,
+     "hits" : [ ]
+   },
+   "aggregations" : {
+     "sum" : {
+       "value" : 6509892.0
+     }
+   }
+}
+
+#-------------------------------------------
+# Total number of emojis in original tweets (text type only, excluding rtext and qtext)
+#-------------------------------------------
+curl -H "Content-Type: application/json" -XGET '127.0.0.1:9200/ukraine/_search?pretty' -d '
+{
+   "query": {
+     "bool": {
+       "must": [
+         {
+           "match": {
+             "original_field": "text"
+           }
+         }
+       ]
+     }
+   }, "size": 0,
+"aggs" : {
+"sum": {
+"sum": {"field" : "n_emoji"}
+}
+}
+}
+'
+{
+   "took" : 92,
+   "timed_out" : false,
+   "_shards" : {
+     "total" : 1,
+     "successful" : 1,
+     "skipped" : 0,
+     "failed" : 0
+   },
+   "hits" : {
+     "total" : {
+       "value" : 10000,
+       "relation" : "gte"
+     },
+     "max_score" : null,
+     "hits" : [ ]
+   },
+   "aggregations" : {
+     "sum" : {
+       "value" : 1097124.0
+     }
+   }
+}
+
+#-------------------------------------------
+# Confirmation in MariaDB
+#-------------------------------------------
+MariaDB [emojis]> SELECT SUM(emp_count) FROM emoji_project JOIN project ON emp_proid=pro_id WHERE pro_name='ukraine';
++----------------+
+| SUM(emp_count) |
++----------------+
+| 1097124 |
++----------------+
+1 row in set (0.012 sec)
+
+
+
+################################################ ######################
+# Summary tables
+################################################ ######################
+
+#-------------------------------------------
+# Prominent emojis - closeness
+#-------------------------------------------
+http://localhost/distance.php?index=ukraine
+
+#-------------------------------------------
+# Top 50
+#-------------------------------------------
+http://localhost/top50.php?index=ukraine
+
+#-------------------------------------------
+# Top 50 IDF
+#-------------------------------------------
+http://localhost/top50idf.php?index=ukraine
+
+
+

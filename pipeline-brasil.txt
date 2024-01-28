@@ -1,0 +1,740 @@
+######################################################
+Complete pipeline with all the information
+######################################################
+# Pipeline for BRASIL:
+
+cd /disco2/keyphrase
+./proc_tweets.py -d /disco2/BRASIL/tweets/2023-01
+
+./ngo.sh /disco2/BRASIL/tweets/2022-02
+
+./creat_tw.py -d /disco2/BRASIL/tweets/2022-02
+
+#############################################################
+# Restart ElasticSearch on Ubuntu
+
+service elasticsearch restart
+
+################################################################
+# Allow an ElasticSearch scroll to live for 30 days. The default is 1 day (24h)
+# https://www.elastic.co/guide/en/elasticsearch/reference/current/cluster-update-settings.html
+#
+# As I make a query to get all the records, this may cause a timeout.
+# To do this, you need to use the scroll and timeout parameters in the "elasticsearch.helpers.scan" function
+# https://www.elastic.co/guide/en/elasticsearch/reference/current/paginate-search-results.html#scroll-search-context
+# https://www.elastic.co/guide/en/elasticsearch/reference/current/common-options.html#time-units
+# https://github.com/elastic/elasticsearch-dsl-py/issues/796
+# https://stackoverflow.com/questions/33301119/error-with-elasticsearch-helpers-scan-api-when-using-query-parameter
+
+curl -X PUT "localhost:9200/_cluster/settings" -H 'Content-Type: application/json' -d'
+{
+  "persistent" : {
+    "search.max_keep_alive" : "30d"
+  }
+}
+'
+################################################################
+### Delete previous records, if necessary
+### curl -H "Content-Type: application/json" -XDELETE 127.0.0.1:9200/brasil
+
+# Create the mapping
+# Create a field in elasticsearch for searches by 24 different processors, to allow multiprocessing when loading neo4j
+# Create a field in elasticsearch to process data for different days, from 1 to 31
+# Create a field in elasticsearch to store the sum of emojis in the emojis array
+
+curl -H "Content-Type: application/json" -XPUT 127.0.0.1:9200/brasil -d '
+{
+	"mappings": {
+		"properties": {
+			"id_str": {"type": "long"}, 
+			"created_at": {"type": "date"}, 
+			"text": {"type": "text"}, 
+			"emoji": {
+				"type": "text", 
+				"fields": { "keyword": { "type": "keyword" } }
+			},
+			"id24": {"type": "long"},
+			"id31": {"type": "long"},
+			"n_emoji": {"type": "long"}
+		 }
+	}
+}
+'
+
+# Confirm the mapping
+curl -H "Content-Type: application/json" -XGET '127.0.0.1:9200/brasil/_mapping?pretty'
+
+mkdir /disco5/BRASIL
+mkdir /disco5/BRASIL/tweets
+rsync -zarv  --prune-empty-dirs --include "*/"  --include="*.tw" --exclude="*" "/disco2/BRASIL/tweets/" "/disco5/BRASIL/tweets/"
+
+cd /disco2/keyphrase
+./read2ES.py -i brasil -d /disco5/BRASIL/tweets/2023-01
+
+# Confirm insertion
+curl -H "Content-Type: application/json" -XGET '127.0.0.1:9200/brasil/_count?pretty'
+{
+  "count" : 23705388,
+  "_shards" : {
+    "total" : 1,
+    "successful" : 1,
+    "skipped" : 0,
+    "failed" : 0
+  }
+}
+
+rm -r /disco5/BRASIL/
+
+################################################################
+# Create 31 groups - one for each day of the month - within the CLIMATE index, to then process each day separately
+# Create 24 groups - one for each hour of the day - within the CLIMATE index, and then assign them to 24 processors
+# It took 3979686 millis to update, there are 23705388 entries in elasticsearch
+# Fill in the n_emoji field with the sum of the emojis in the document
+curl -X POST "localhost:9200/brasil/_update_by_query?pretty" -H 'Content-Type: application/json' -d'
+{
+"query": {"match_all": {}
+         },
+"script": "ctx._source.id31 = Integer.parseInt(ctx._source.created_at.substring(8,10)); ctx._source.id24 = Integer.parseInt(ctx._source.created_at.substring(11,13)); ctx._source.n_emoji = ctx._source.emoji.length"
+}
+'
+
+#--------------------------------------------------------
+# Monitor the evolution of previous code
+
+# Count docs without id24
+curl -X POST "localhost:9200/brasil/_count?pretty" -H 'Content-Type: application/json' -d'
+{"query": {"bool": {"must_not": [{"exists": {"field": "id24"}}]}}}'
+
+# Count docs with id24
+curl -X POST "localhost:9200/brasil/_count?pretty" -H 'Content-Type: application/json' -d'
+{"query": {"bool": {"must": [{"exists": {"field": "id24"}}]}}}'
+
+
+################################################ ####
+# I have to increase the number of possible ES answers. I may have to do this several times until the command below stops giving an error.
+curl -X PUT "localhost:9200/_settings" -H 'Content-Type: application/json' -d'
+{"index.max_result_window": 2000000000}'
+
+################################################ ####
+# Launch neo4j:
+
+/usr/local/neo4j/bin/neo4j console
+
+# Put all emojis in Neo4j and MariaDB
+# In Neo4j, add the "n.brasil" property to each emoji, with the number of occurrences of that emoji
+cd /disco2/keyphrase
+./esPutEmojiNeo4jMariaDB.py -i brasil -d 1
+./esPutEmojiNeo4jMariaDB.py -i brasil -d 2
+./esPutEmojiNeo4jMariaDB.py -i brasil -d 3
+./esPutEmojiNeo4jMariaDB.py -i brasil -d 4
+./esPutEmojiNeo4jMariaDB.py -i brasil -d 5
+./esPutEmojiNeo4jMariaDB.py -i brasil -d 6
+./esPutEmojiNeo4jMariaDB.py -i brasil -d 7
+./esPutEmojiNeo4jMariaDB.py -i brasil -d 8
+./esPutEmojiNeo4jMariaDB.py -i brasil -d 9
+./esPutEmojiNeo4jMariaDB.py -i brasil -d 10
+./esPutEmojiNeo4jMariaDB.py -i brasil -d 11
+./esPutEmojiNeo4jMariaDB.py -i brasil -d 12
+./esPutEmojiNeo4jMariaDB.py -i brasil -d 13
+./esPutEmojiNeo4jMariaDB.py -i brasil -d 14
+./esPutEmojiNeo4jMariaDB.py -i brasil -d 15
+./esPutEmojiNeo4jMariaDB.py -i brasil -d 16
+./esPutEmojiNeo4jMariaDB.py -i brasil -d 17
+./esPutEmojiNeo4jMariaDB.py -i brasil -d 18
+./esPutEmojiNeo4jMariaDB.py -i brasil -d 19
+./esPutEmojiNeo4jMariaDB.py -i brasil -d 20
+./esPutEmojiNeo4jMariaDB.py -i brasil -d 21
+./esPutEmojiNeo4jMariaDB.py -i brasil -d 22
+./esPutEmojiNeo4jMariaDB.py -i brasil -d 23
+./esPutEmojiNeo4jMariaDB.py -i brasil -d 24
+./esPutEmojiNeo4jMariaDB.py -i brasil -d 25
+./esPutEmojiNeo4jMariaDB.py -i brasil -d 26
+./esPutEmojiNeo4jMariaDB.py -i brasil -d 27
+./esPutEmojiNeo4jMariaDB.py -i brasil -d 28
+./esPutEmojiNeo4jMariaDB.py -i brasil -d 29
+./esPutEmojiNeo4jMariaDB.py -i brasil -d 30
+./esPutEmojiNeo4jMariaDB.py -i brasil -d 31
+
+################################################################
+# Times that the previous commands took:
+
+root@alex:/disco2/keyphrase# ./esPutEmojiNeo4jMariaDB.py -i brasil -d 1
+Total time 3.2057693004608154 seconds
+root@alex:/disco2/keyphrase# ./esPutEmojiNeo4jMariaDB.py -i brasil -d 2
+Total time 0.28716254234313965 seconds
+root@alex:/disco2/keyphrase# ./esPutEmojiNeo4jMariaDB.py -i brasil -d 3
+Total time 55.81453204154968 seconds
+root@alex:/disco2/keyphrase# ./esPutEmojiNeo4jMariaDB.py -i brasil -d 4
+Total time 45.029829025268555 seconds
+root@alex:/disco2/keyphrase# ./esPutEmojiNeo4jMariaDB.py -i brasil -d 5
+Total time 39.55623388290405 seconds
+root@alex:/disco2/keyphrase# ./esPutEmojiNeo4jMariaDB.py -i brasil -d 6
+Total time 35.673874378204346 seconds
+root@alex:/disco2/keyphrase# ./esPutEmojiNeo4jMariaDB.py -i brasil -d 7
+Total time 39.40601992607117 seconds
+root@alex:/disco2/keyphrase# ./esPutEmojiNeo4jMariaDB.py -i brasil -d 8
+Total time 162.06633496284485 seconds
+root@alex:/disco2/keyphrase# ./esPutEmojiNeo4jMariaDB.py -i brasil -d 9
+Total time 71.70492887496948 seconds
+root@alex:/disco2/keyphrase# ./esPutEmojiNeo4jMariaDB.py -i brasil -d 10
+Total time 83.54083490371704 seconds
+root@alex:/disco2/keyphrase# ./esPutEmojiNeo4jMariaDB.py -i brasil -d 11
+Total time 44.63082408905029 seconds
+root@alex:/disco2/keyphrase# ./esPutEmojiNeo4jMariaDB.py -i brasil -d 12
+Total time 60.385605335235596 seconds
+root@alex:/disco2/keyphrase# ./esPutEmojiNeo4jMariaDB.py -i brasil -d 13
+Total time 45.45711708068848 seconds
+root@alex:/disco2/keyphrase# ./esPutEmojiNeo4jMariaDB.py -i brasil -d 14
+Total time 37.5202260017395 seconds
+root@alex:/disco2/keyphrase# ./esPutEmojiNeo4jMariaDB.py -i brasil -d 15
+Total time 29.382107496261597 seconds
+root@alex:/disco2/keyphrase# ./esPutEmojiNeo4jMariaDB.py -i brasil -d 16
+Total time 33.82982540130615 seconds
+root@alex:/disco2/keyphrase# ./esPutEmojiNeo4jMariaDB.py -i brasil -d 17
+Total time 36.61810231208801 seconds
+root@alex:/disco2/keyphrase# ./esPutEmojiNeo4jMariaDB.py -i brasil -d 18
+Total time 37.83168983459473 seconds
+root@alex:/disco2/keyphrase# ./esPutEmojiNeo4jMariaDB.py -i brasil -d 19
+Total time 41.830930948257446 seconds
+root@alex:/disco2/keyphrase# ./esPutEmojiNeo4jMariaDB.py -i brasil -d 20
+Total time 0.2531929016113281 seconds
+root@alex:/disco2/keyphrase# ./esPutEmojiNeo4jMariaDB.py -i brasil -d 21
+Total time 0.24952268600463867 seconds
+root@alex:/disco2/keyphrase# ./esPutEmojiNeo4jMariaDB.py -i brasil -d 22
+Total time 0.25355005264282227 seconds
+root@alex:/disco2/keyphrase# ./esPutEmojiNeo4jMariaDB.py -i brasil -d 23
+Total time 0.25258874893188477 seconds
+root@alex:/disco2/keyphrase# ./esPutEmojiNeo4jMariaDB.py -i brasil -d 24
+Total time 0.25798630714416504 seconds
+root@alex:/disco2/keyphrase# ./esPutEmojiNeo4jMariaDB.py -i brasil -d 25
+Total time 0.25504374504089355 seconds
+root@alex:/disco2/keyphrase# ./esPutEmojiNeo4jMariaDB.py -i brasil -d 26
+Total time 0.25459742546081543 seconds
+root@alex:/disco2/keyphrase# ./esPutEmojiNeo4jMariaDB.py -i brasil -d 27
+Total time 0.25675392150878906 seconds
+root@alex:/disco2/keyphrase# ./esPutEmojiNeo4jMariaDB.py -i brasil -d 28
+Total time 0.2563943862915039 seconds
+root@alex:/disco2/keyphrase# ./esPutEmojiNeo4jMariaDB.py -i brasil -d 29
+Total time 0.2533388137817383 seconds
+root@alex:/disco2/keyphrase# ./esPutEmojiNeo4jMariaDB.py -i brasil -d 30
+Total time 0.25783538818359375 seconds
+root@alex:/disco2/keyphrase# ./esPutEmojiNeo4jMariaDB.py -i brasil -d 31
+Total time 0.2636444568634033 seconds
+
+################################################ ##############
+# Confirm, in Neo4j
+MATCH (n) RETURN SUM(n.brasil)
+1844412
+
+################################################ ##############
+# Confirm, in MariaDB
+MariaDB [emojis]> SELECT SUM(emp_count) FROM emoji_project JOIN project ON pro_id=emp_proid AND pro_name='brasil';
++----------------+
+| SUM(emp_count) |
++----------------+
+| 1844412 |
++----------------+
+1 row in set (0.006 sec)
+
+######################################################
+# Pass co-occurrences to MariaDB
+# For BRAZIL, each day must be passed separately, as there is a lot of data
+
+./esPutMariaDB.py -i brasil -d 1
+./esPutMariaDB.py -i brasil -d 2
+./esPutMariaDB.py -i brasil -d 3
+./esPutMariaDB.py -i brasil -d 4
+./esPutMariaDB.py -i brasil -d 5
+./esPutMariaDB.py -i brasil -d 6
+./esPutMariaDB.py -i brasil -d 7
+./esPutMariaDB.py -i brasil -d 8
+./esPutMariaDB.py -i brasil -d 9
+./esPutMariaDB.py -i brasil -d 10
+./esPutMariaDB.py -i brasil -d 11
+./esPutMariaDB.py -i brasil -d 12
+./esPutMariaDB.py -i brasil -d 13
+./esPutMariaDB.py -i brasil -d 14
+./esPutMariaDB.py -i brasil -d 15
+./esPutMariaDB.py -i brasil -d 16
+./esPutMariaDB.py -i brasil -d 17
+./esPutMariaDB.py -i brasil -d 18
+./esPutMariaDB.py -i brasil -d 19
+./esPutMariaDB.py -i brasil -d 20
+./esPutMariaDB.py -i brasil -d 21
+./esPutMariaDB.py -i brasil -d 22
+./esPutMariaDB.py -i brasil -d 23
+./esPutMariaDB.py -i brasil -d 24
+./esPutMariaDB.py -i brasil -d 25
+./esPutMariaDB.py -i brasil -d 26
+./esPutMariaDB.py -i brasil -d 27
+./esPutMariaDB.py -i brasil -d 28
+./esPutMariaDB.py -i brasil -d 29
+./esPutMariaDB.py -i brasil -d 30
+./esPutMariaDB.py -i brasil -d 31
+
+################################################ ##############
+# Times that the previous commands took:
+
+root@alex:/disco2/keyphrase# ./esPutMariaDB.py -i brasil -d 1
+Total time 0.14475202560424805 seconds
+root@alex:/disco2/keyphrase# ./esPutMariaDB.py -i brasil -d 2
+Total time 0.06791472434997559 seconds
+root@alex:/disco2/keyphrase# ./esPutMariaDB.py -i brasil -d 3
+Total time 21.55136752128601 seconds
+root@alex:/disco2/keyphrase# ./esPutMariaDB.py -i brasil -d 4
+Total time 17.166908979415894 seconds
+root@alex:/disco2/keyphrase# ./esPutMariaDB.py -i brasil -d 5
+Total time 16.022122383117676 seconds
+root@alex:/disco2/keyphrase# ./esPutMariaDB.py -i brasil -d 6
+Total time 17.34313464164734 seconds
+root@alex:/disco2/keyphrase# ./esPutMariaDB.py -i brasil -d 7
+Total time 17.042853355407715 seconds
+root@alex:/disco2/keyphrase# ./esPutMariaDB.py -i brasil -d 8
+Total time 49.4046676158905 seconds
+root@alex:/disco2/keyphrase# ./esPutMariaDB.py -i brasil -d 9
+Total time 24.113347053527832 seconds
+root@alex:/disco2/keyphrase# ./esPutMariaDB.py -i brasil -d 10
+Total time 28.501038312911987 seconds
+root@alex:/disco2/keyphrase# ./esPutMariaDB.py -i brasil -d 11
+Total time 23.24841809272766 seconds
+root@alex:/disco2/keyphrase# ./esPutMariaDB.py -i brasil -d 12
+Total time 36.44173574447632 seconds
+root@alex:/disco2/keyphrase# ./esPutMariaDB.py -i brasil -d 13
+Total time 25.473256826400757 seconds
+root@alex:/disco2/keyphrase# ./esPutMariaDB.py -i brasil -d 14
+Total time 27.55584478378296 seconds
+root@alex:/disco2/keyphrase# ./esPutMariaDB.py -i brasil -d 15
+Total time 21.9467031955719 seconds
+root@alex:/disco2/keyphrase# ./esPutMariaDB.py -i brasil -d 16
+Total time 22.964736700057983 seconds
+root@alex:/disco2/keyphrase# ./esPutMariaDB.py -i brasil -d 17
+Total time 26.43731951713562 seconds
+root@alex:/disco2/keyphrase# ./esPutMariaDB.py -i brasil -d 18
+Total time 26.908177375793457 seconds
+root@alex:/disco2/keyphrase# ./esPutMariaDB.py -i brasil -d 19
+Total time 23.34304642677307 seconds
+root@alex:/disco2/keyphrase# ./esPutMariaDB.py -i brasil -d 20
+Total time 0.060968637466430664 seconds
+root@alex:/disco2/keyphrase# ./esPutMariaDB.py -i brasil -d 21
+Total time 0.058472633361816406 seconds
+root@alex:/disco2/keyphrase# ./esPutMariaDB.py -i brasil -d 22
+Total time 0.07858157157897949 seconds
+root@alex:/disco2/keyphrase# ./esPutMariaDB.py -i brasil -d 23
+Total time 0.060019731521606445 seconds
+root@alex:/disco2/keyphrase# ./esPutMariaDB.py -i brasil -d 24
+Total time 0.05989527702331543 seconds
+root@alex:/disco2/keyphrase# ./esPutMariaDB.py -i brasil -d 25
+Total time 0.060578107833862305 seconds
+root@alex:/disco2/keyphrase# ./esPutMariaDB.py -i brasil -d 26
+Total time 0.06370067596435547 seconds
+root@alex:/disco2/keyphrase# ./esPutMariaDB.py -i brasil -d 27
+Total time 0.06064414978027344 seconds
+root@alex:/disco2/keyphrase# ./esPutMariaDB.py -i brasil -d 28
+Total time 0.058060646057128906 seconds
+root@alex:/disco2/keyphrase# ./esPutMariaDB.py -i brasil -d 29
+Total time 0.05704498291015625 seconds
+root@alex:/disco2/keyphrase# ./esPutMariaDB.py -i brasil -d 30
+Total time 0.0638430118560791 seconds
+root@alex:/disco2/keyphrase# ./esPutMariaDB.py -i brasil -d 31
+Total time 0.060764312744140625 seconds
+
+######################################################
+# Confirm in MariaDB
+
+MariaDB [emojis]> SELECT COUNT(*) FROM follow WHERE fol_index='brasil';
++----------+
+| COUNT(*) |
++----------+
+| 457039 |
++----------+
+1 row in set (0.173 sec)
+
+
+# After loading all the data into the FOLLOW table, run the following SQL:
+UPDATE follow SET fol_hour=HOUR(fol_created_at) WHERE fol_hour IS NULL;
+UPDATE follow SET fol_day=DAY(fol_created_at) WHERE fol_day IS NULL;
+
+MariaDB [emojis]> UPDATE follow SET fol_hour=HOUR(fol_created_at) WHERE fol_hour IS NULL;
+Query OK, 457039 rows affected (8,183 sec)
+Rows matched: 457039 Changed: 457039 Warnings: 0
+
+MariaDB [emojis]> UPDATE follow SET fol_day=DAY(fol_created_at) WHERE fol_day IS NULL;
+Query OK, 457039 rows affected (11,558 sec)
+Rows matched: 457039 Changed: 457039 Warnings: 0
+
+################################################ ####
+# Pass co-occurrences to neo4j
+
+./mdbPutNeoFollow.py -i brazil
+Total time 309.8009843826294 seconds
+
+# Confirm that everything is ok in neo4j
+MATCH (n)-[r:FOLLOWED_BY { index: "brasil" }]->(m) RETURN COUNT(r)
+457039
+
+################################################ ####
+# To add keyphrases to neo4j, in summary form for each co-occurrence
+#-------------------------------------
+# With MariaDB it seems to be faster
+cd /disco2/keyphrase
+./esPutMariaDBKeyphrase.py -i brazil
+Total time 622.5594036579132 seconds
+
+#-------------------------------------
+# The previous procedure can be slow, so in MariaDB, you can follow the evolution:
+# Number of entries in KEYPHRASE
+SELECT COUNT(*) FROM keyphrase WHERE key_index='brazil';
++----------+
+| COUNT(*) |
++----------+
+| 48845 |
++----------+
+1 row in set (0.000 sec)
+
+# Number of entries already processed and already in PHRASE
+SELECT COUNT(DISTINCT phr_keyid) FROM phrase WHERE phr_keyid IN (SELECT key_id FROM keyphrase WHERE key_index='brasil');
++---------------------------+
+| COUNT(DISTINCT phr_keyid) |
++---------------------------+
+| 47688 |
++---------------------------+
+1 row in set (0.389 sec)
+
+#----------------------------------------------
+# Put the counts in key_count
+# I had to do this, to have the count at hand, and not have to count at the moment
+# This makes it easier to sort in descending counting order, particularly when searching between dates
+# NOTE: this is the count of how many co-occurrences there are of a given pair of emojis (between two dates, or without date limit, depends on each case)
+# NOTE2: I don't know if this particular script is prepared to work with dates - CONFIRM
+
+./mdbPutKeyphraseCountByIndex.py -i brazil
+Total time 219.63264441490173 seconds
+
+#--------------------------------------------------
+# Pass Keyphrases from MariaDB to Neo4j
+
+./mdbPutNeoKeyphrase.py -i brasil
+Total time 28.535736083984375 seconds
+
+################################################ ####
+Place IDF fields in MariaDB's PHRASE table
+
+./mdbPutIDF.py -i brasil
+Total time 1547.8049371242523 seconds
+
+######################################################
+# Update the phr_tfidf field
+
+mysql
+\remojis
+UPDATE phrase SET phr_tfidf=phr_count*phr_idf WHERE phr_tfidf IS NULL;
+
+MariaDB [emojis]> UPDATE phrase SET phr_tfidf=phr_count*phr_idf WHERE phr_tfidf IS NULL;
+Query OK, 873007 rows affected (22,054 sec)
+Rows matched: 873007 Changed: 873007 Warnings: 0
+
+#---------------------------------------------------------------- ---
+# Same for the phr_weightidf field
+
+mysql
+\remojis
+UPDATE phrase SET phr_weightidf=phr_weight*phr_idf WHERE phr_weightidf IS NULL;
+
+MariaDB [emojis]> UPDATE phrase SET phr_weightidf=phr_weight*phr_idf WHERE phr_weightidf IS NULL;
+Query OK, 873007 rows affected (29,044 sec)
+Rows matched: 873007 Changed: 873007 Warnings: 0
+
+#--------------------------------------------------
+# Pass Keyphrases from MariaDB to Neo4j - but now, ordered by phr_weightidf DESC
+
+./mdbPutNeoIdfKeyphrase.py -i brasil
+Total time 29.791566610336304 seconds
+
+################################################ ################################
+# Counts
+################################################ ################################
+
+################################################ ################################
+# Count the total number of co-occurrences in ElasticSearch
+
+cd /disco2/keyphrase
+./esCountEmojiCO.py -i brazil -o text
+Total co-occurrences: 921303
+Total time 39.569424629211426 seconds
+
+################################################ ################################
+# Count the total number of co-occurrences in Neo4j
+
+#---------------------------------
+# Total co-occurrences, excluding repetitions within the same tweet
+#---------------------------------
+MATCH (n)-[r:FOLLOWED_BY { index: "brasil" }]->(m) RETURN COUNT(r)
+457039
+
+#---------------------------------
+# Total co-occurrences, including repetitions within the same tweet
+#---------------------------------
+MATCH (n)-[r:FOLLOWED_BY { index: "brasil" }]->(m) RETURN SUM(r.count)
+921303
+
+#---------------------------------
+# Total co-occurrences, excluding repetitions. Only the number of co-occurrences, i.e., unique sequences of 2 emojis present in the dataset
+#---------------------------------
+MATCH (n)-[r:KEYPHRASES { index: "brasil" }]->(m) RETURN COUNT(r);
+48845
+
+################################################ ################################
+# Count the total number of co-occurrences in MariaDB
+
+#---------------------------------
+# Total co-occurrences, excluding repetitions within the same tweet
+#---------------------------------
+
+MariaDB [emojis]> SELECT COUNT(*) FROM follow WHERE fol_index='brasil';
++----------+
+| COUNT(*) |
++----------+
+| 457039 |
++----------+
+1 row in set (0.124 sec)
+
+#---------------------------------
+# Total co-occurrences, including repetitions within the same tweet
+#---------------------------------
+
+MariaDB [emojis]> SELECT SUM(fol_count) FROM follow WHERE fol_index='brasil';
++----------------+
+| SUM(fol_count) |
++----------------+
+| 921303 |
++----------------+
+1 row in set (0.832 sec)
+
+#--------------------------
+# For keyphrase table
+
+MariaDB [emojis]>
+SELECT COUNT(*) FROM keyphrase WHERE key_index='brazil';
++----------+
+| COUNT(*) |
++----------+
+| 48845 |
++----------+
+1 row in set (0.036 sec)
+
+
+MariaDB [emojis]> SELECT COUNT(*) FROM phrase WHERE phr_keyid IN (SELECT key_id FROM keyphrase WHERE key_index='brasil');
++----------+
+| COUNT(*) |
++----------+
+| 873007 |
++----------+
+1 row in set (0.373 sec)
+
+
+MATCH (n)-[r:KEYPHRASES { index: "brasil" }]->(m) RETURN COUNT(r);
+48845
+
+####################################################################################
+# emojis-co-occurrence-50-most-used (results are in a file with the name: emojis-co-occurrence-50-most-used.txt)
+
+#-----------------------------------------------
+# Indifferent
+MATCH (n)-[r:FOLLOWED_BY { index: "brasil" }]->(m) RETURN n.emoji,n.name,m.emoji,m.name,SUM(r.count) ORDER BY SUM(r .count) DESC LIMIT 50;
+
+#-----------------------------------------------
+# With repetition
+MATCH (n)-[r:FOLLOWED_BY { index: "brasil" }]->(m) WHERE n.emoji = m.emoji RETURN n.emoji,n.name,m.emoji,m.name,SUM(r .count) ORDER BY SUM(r.count) DESC LIMIT 50;
+
+#-----------------------------------------------
+# No repetition
+MATCH (n)-[r:FOLLOWED_BY { index: "brasil" }]->(m) WHERE n.emoji <> m.emoji RETURN n.emoji,n.name,m.emoji,m.name,SUM( r.count) ORDER BY SUM(r.count) DESC LIMIT 50;
+
+#-----------------------------------------------
+# No repetition and independent of order
+MATCH (n)-[r:FOLLOWED_BY { index: "brasil" }]-(m) WHERE n.emoji <> m.emoji AND ID(n) < ID(m) RETURN n.emoji,n.name,m .emoji,m.name,SUM(r.count) ORDER BY SUM(r.count) DESC LIMIT 50;
+
+################################################ ######################
+# Count number of tweets
+################################################ ######################
+
+#-------------------------------------------
+# Original tweets, (no retweets or quoted tweets)
+#-------------------------------------------
+curl -H "Content-Type: application/json" -XGET '127.0.0.1:9200/brasil/_count?pretty' -d '
+{
+   "query": {
+     "bool": {
+       "must": [
+         {
+           "match": {
+             "original_field": "text"
+           }
+         }
+       ]
+     }
+   }
+}
+'
+{
+   "count" : 5179150,
+   "_shards" : {
+     "total" : 1,
+     "successful" : 1,
+     "skipped" : 0,
+     "failed" : 0
+   }
+}
+
+
+#-------------------------------------------
+# All Tweets (with retweets, and quoted tweets)
+#-------------------------------------------
+curl -H "Content-Type: application/json" -XGET '127.0.0.1:9200/brasil/_count?pretty'
+{
+   "count" : 23705388,
+   "_shards" : {
+     "total" : 1,
+     "successful" : 1,
+     "skipped" : 0,
+     "failed" : 0
+   }
+}
+
+################################################ ######################
+# Count the total number of emojis
+################################################ ######################
+
+#-------------------------------------------
+# Total number of emojis in all tweets (including text, rtext and qtext)
+#-------------------------------------------
+curl -H "Content-Type: application/json" -XGET '127.0.0.1:9200/brasil/_search?pretty' -d '
+{ "query": {"match_all": {} }, "size": 0, "aggs" : { "sum": {"sum": {"field" : "n_emoji"} }}}'
+
+{
+   "took" : 1101,
+   "timed_out" : false,
+   "_shards" : {
+     "total" : 1,
+     "successful" : 1,
+     "skipped" : 0,
+     "failed" : 0
+   },
+   "hits" : {
+     "total" : {
+       "value" : 10000,
+       "relation" : "gte"
+     },
+     "max_score" : null,
+     "hits" : [ ]
+   },
+   "aggregations" : {
+     "sum" : {
+       "value" : 1.0394528E7
+     }
+   }
+}
+
+
+#-------------------------------------------
+# Total number of emojis in original tweets (text type only, excluding rtext and qtext)
+#-------------------------------------------
+curl -H "Content-Type: application/json" -XGET '127.0.0.1:9200/brasil/_search?pretty' -d '
+{ "query": {"bool": {"must": [ {"match": {"original_field": "text" } } ] } }, "size": 0, "aggs": {"sum": {"sum": {"field" : "n_emoji"} } }}'
+
+{"field" : "n_emoji"} } }}'
+{
+   "took" : 284,
+   "timed_out" : false,
+   "_shards" : {
+     "total" : 1,
+     "successful" : 1,
+     "skipped" : 0,
+     "failed" : 0
+   },
+   "hits" : {
+     "total" : {
+       "value" : 10000,
+       "relation" : "gte"
+     },
+     "max_score" : null,
+     "hits" : [ ]
+   },
+   "aggregations" : {
+     "sum" : {
+       "value" : 1844412.0
+     }
+   }
+}
+
+#-------------------------------------------
+# Confirmation in MariaDB
+#-------------------------------------------
+MariaDB [emojis]> SELECT SUM(emp_count) FROM emoji_project JOIN project ON emp_proid=pro_id WHERE pro_name='brasil';
++----------------+
+| SUM(emp_count) |
++----------------+
+| 1844412 |
++----------------+
+1 row in set (0.010 sec)
+
+################################################ ######################
+# Maximum and minimum date of tweets
+################################################ ######################
+
+curl -X POST "localhost:9200/brasil/_search?size=0&pretty" -H 'Content-Type: application/json' -d'
+{
+"aggs" : {
+        "min_date": {"min": {"field": "created_at"}},
+        "max_date": {"max": {"field": "created_at"}}
+     }
+}
+'
+{
+   "took" : 223,
+   "timed_out" : false,
+   "_shards" : {
+     "total" : 1,
+     "successful" : 1,
+     "skipped" : 0,
+     "failed" : 0
+   },
+   "hits" : {
+     "total" : {
+       "value" : 10000,
+       "relation" : "gte"
+     },
+     "max_score" : null,
+     "hits" : [ ]
+   },
+   "aggregations" : {
+     "max_date" : {
+       "value" : 1.674095069E12,
+       "value_as_string" : "2023-01-19T02:24:29.000Z"
+     },
+     "min_date" : {
+       "value" : 1.672720402E12,
+       "value_as_string" : "2023-01-03T04:33:22.000Z"
+     }
+   }
+}
+
+
+################################################ ######################
+# Summary tables
+################################################ ######################
+
+#-------------------------------------------
+# Prominent emojis - closeness
+#-------------------------------------------
+http://localhost/distance.php?index=brasil
+
+#-------------------------------------------
+# Top 50
+#-------------------------------------------
+http://localhost/top50.php?index=brasil
+
+#-------------------------------------------
+# Top 50 IDF
+#-------------------------------------------
+http://localhost/top50idf.php?index=brasil
